@@ -62,7 +62,7 @@ all = [
 
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/atlas_memory", "src/ATLAS_memory", "src/loop_memory"]
+packages = ["src/atlas_memory"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
