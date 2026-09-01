@@ -69,7 +69,11 @@ jobs:
         uses: prefix-dev/setup-pixi@v0.8.1
         with:
           pixi-version: v0.70.0
+<<<<<<< HEAD
           cache: true
+=======
+          cache: false
+>>>>>>> feat/v32-full-throttle-daemon-mnemosyne
 
       - name: Run Integration & IPC Test Suite
         run: pixi run pytest tests/integration/ -v
@@ -88,7 +92,11 @@ jobs:
         uses: prefix-dev/setup-pixi@v0.8.1
         with:
           pixi-version: v0.70.0
+<<<<<<< HEAD
           cache: true
+=======
+          cache: false
+>>>>>>> feat/v32-full-throttle-daemon-mnemosyne
 
       - name: Run Subsystem Micro-Benchmarks (Popcount, CRDT, Latency)
         run: pixi run pytest tests/benchmark/test_benchmark_atlas_v15.py -v
