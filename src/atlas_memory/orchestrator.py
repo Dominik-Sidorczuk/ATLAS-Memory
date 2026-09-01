@@ -9,7 +9,6 @@ from atlas_memory.extensions.canonicalizer import EntityCanonicalizer
 from atlas_memory.extensions.compactor import ContextCompactor
 from atlas_memory.extensions.decay_scorer import SalienceDecayEngine
 from atlas_memory.extensions.epistemic import EpistemicCalibrator
-from atlas_memory.hermes.prefix_guard import PrefixCacheGuard
 from atlas_memory.models import (
     EpistemicSource,
     MemoryRecord,
@@ -99,6 +98,8 @@ class MemoryOrchestrator:
             "Memory Protocol: Dynamic facts are injected via Mnemosyne / search_memory.",
             "Deterministic Execution: Rely on Verified Source of Truth state variables.",
         ]
+        from atlas_memory.hermes.prefix_guard import PrefixCacheGuard
+
         return PrefixCacheGuard.build_immutable_prefix(
             verified_state=profile_state or {},
             system_rules=rules,

@@ -13,50 +13,10 @@ Subsystems:
 
 import sys
 
-from atlas_memory.active.prediction_error import ActiveSensingEngine, PredictionCheck, PredictionError
-from atlas_memory.active.shadow_worker import OmniRouteShadowWorker
-from atlas_memory.arrow_buffer.trajectory_buffer import ArrowTrajectoryBuffer
-from atlas_memory.causal.models import CausalEdge, CausalPath, WhatIfResult
-
-# ATLAS Subsystems
-from atlas_memory.causal.retro_causal_edge import RetroCausalEngine
-
 # Alias ATLAS_memory for case-insensitive module lookups
 sys.modules.setdefault("ATLAS_memory", sys.modules[__name__])
-from atlas_memory.engine import HybridMemoryEngine
-from atlas_memory.extensions.canonicalizer import EntityCanonicalizer, EntityEntry
-from atlas_memory.extensions.compactor import CompactionLevel, ContextCompactor
-from atlas_memory.extensions.decay_scorer import SalienceDecayEngine
-from atlas_memory.extensions.epistemic import EpistemicCalibrator
-from atlas_memory.hermes.prefix_guard import HermesSessionHook, PrefixCacheGuard
-from atlas_memory.hermes.tools import (
-    COMMIT_OBSERVATION_SCHEMA,
-    SEARCH_MEMORY_SCHEMA,
-    create_hermes_tool_handlers,
-    register_hermes_memory_tools,
-)
-from atlas_memory.hermes_integration import HermesMemoryAdapter
-from atlas_memory.l0_dynamic.ttt_layer import TTTLayer
-from atlas_memory.l1_working.jepa_latent import JEPALatentBuffer
-from atlas_memory.l2_semantic import (
-    EpisodicVectorStore,
-    FastEmbedEncoder,
-    KuzuGraphStore,
-    QdrantVectorStore,
-    SimpleEmbeddingEncoder,
-    SymbolicGraphStore,
-    VerifiedKVStore,
-)
-from atlas_memory.l3_procedural.auditor import MemoryAuditor
-from atlas_memory.l3_procedural.skill_compiler import (
-    ASTSafetyScanner,
-    SafetyViolationError,
-    compile_and_register_sop,
-    compile_sop_to_skill,
-    register_in_hermes_environment,
-)
-from atlas_memory.l3_procedural.sleep_baker import SleepBaker, StandardProcedure, Step
-from atlas_memory.l3_procedural.weight_baker import BakedProcedure, WeightBaker
+
+# Base models & client are pure Python (always available)
 from atlas_memory.models import (
     ActionPlan,
     ConflictReport,
@@ -67,28 +27,73 @@ from atlas_memory.models import (
     PredictedTransition,
     RecallResult,
 )
-from atlas_memory.orchestrator import MemoryOrchestrator
-from atlas_memory.quantization import (
-    MIBQuantizer,
-    QuantizationConfig,
-    QuantizedVector,
-    SIMDHamming,
-)
-from atlas_memory.server import AtlasDaemon, AtlasDaemonClient
-from atlas_memory.sync import (
-    DeltaCRDT,
-    GossipProtocol,
-    LWWElementSet,
-    SyncCrypto,
-    VectorClock,
-)
-from atlas_memory.sync.transport import (
-    GossipTransport,
-    InMemoryGossipTransport,
-    UDPGossipTransport,
-    create_transport,
-)
-from atlas_memory.telemetry.cache_monitor import CacheEvent, CacheHitMonitor
+from atlas_memory.server import AtlasDaemonClient
+
+# Gracefully import heavy engine & C-extension subsystems
+try:
+    from atlas_memory.active.prediction_error import ActiveSensingEngine, PredictionCheck, PredictionError
+    from atlas_memory.active.shadow_worker import OmniRouteShadowWorker
+    from atlas_memory.arrow_buffer.trajectory_buffer import ArrowTrajectoryBuffer
+    from atlas_memory.causal.models import CausalEdge, CausalPath, WhatIfResult
+    from atlas_memory.causal.retro_causal_edge import RetroCausalEngine
+    from atlas_memory.engine import HybridMemoryEngine
+    from atlas_memory.extensions.canonicalizer import EntityCanonicalizer, EntityEntry
+    from atlas_memory.extensions.compactor import CompactionLevel, ContextCompactor
+    from atlas_memory.extensions.decay_scorer import SalienceDecayEngine
+    from atlas_memory.extensions.epistemic import EpistemicCalibrator
+    from atlas_memory.hermes.prefix_guard import HermesSessionHook, PrefixCacheGuard
+    from atlas_memory.hermes.tools import (
+        COMMIT_OBSERVATION_SCHEMA,
+        SEARCH_MEMORY_SCHEMA,
+        create_hermes_tool_handlers,
+        register_hermes_memory_tools,
+    )
+    from atlas_memory.hermes_integration import HermesMemoryAdapter
+    from atlas_memory.l0_dynamic.ttt_layer import TTTLayer
+    from atlas_memory.l1_working.jepa_latent import JEPALatentBuffer
+    from atlas_memory.l2_semantic import (
+        EpisodicVectorStore,
+        FastEmbedEncoder,
+        KuzuGraphStore,
+        QdrantVectorStore,
+        SimpleEmbeddingEncoder,
+        SymbolicGraphStore,
+        VerifiedKVStore,
+    )
+    from atlas_memory.l3_procedural.auditor import MemoryAuditor
+    from atlas_memory.l3_procedural.skill_compiler import (
+        ASTSafetyScanner,
+        SafetyViolationError,
+        compile_and_register_sop,
+        compile_sop_to_skill,
+        register_in_hermes_environment,
+    )
+    from atlas_memory.l3_procedural.sleep_baker import SleepBaker, StandardProcedure, Step
+    from atlas_memory.l3_procedural.weight_baker import BakedProcedure, WeightBaker
+    from atlas_memory.orchestrator import MemoryOrchestrator
+    from atlas_memory.quantization import (
+        MIBQuantizer,
+        QuantizationConfig,
+        QuantizedVector,
+        SIMDHamming,
+    )
+    from atlas_memory.server import AtlasDaemon
+    from atlas_memory.sync import (
+        DeltaCRDT,
+        GossipProtocol,
+        LWWElementSet,
+        SyncCrypto,
+        VectorClock,
+    )
+    from atlas_memory.sync.transport import (
+        GossipTransport,
+        InMemoryGossipTransport,
+        UDPGossipTransport,
+        create_transport,
+    )
+    from atlas_memory.telemetry.cache_monitor import CacheEvent, CacheHitMonitor
+except ImportError:
+    pass
 
 __all__ = [
     # Core Engine & Orchestrator

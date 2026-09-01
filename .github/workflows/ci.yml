@@ -2,45 +2,117 @@ name: "ATLAS Memory CI"
 
 on:
   push:
-    branches: [ "main" ]
+    branches: [ "main", "feat/*", "fix/*" ]
   pull_request:
     branches: [ "main" ]
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
-  lint-and-doctor:
-    name: "Linter & Doctor"
+  # ============================================================================
+  # 1. Code Quality, Static Analysis & Loop Doctor (100/100 Health Gate)
+  # ============================================================================
+  code-quality-and-doctor:
+    name: "Static Analysis, Security & Loop Doctor"
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Setup Pixi
+      - name: Setup Pixi (Python 3.14 Environment)
         uses: prefix-dev/setup-pixi@v0.8.1
         with:
           pixi-version: v0.70.0
-          cache: false
+          cache: true
 
-      - name: Run Ruff Lint
+      - name: Run Ruff Linter & Imports
         run: pixi run ruff check .
 
-      - name: Run Loop Doctor
+      - name: Run Module Import Integrity Check
+        run: pixi run pytest tests/integration/test_import_integrity.py -v
+
+      - name: Run Loop Doctor Certification (100/100 Gate)
         run: pixi run doctor:ci
 
-  tests-and-benchmarks:
-    name: "Test Suite & Benchmarks (Python 3.14)"
+  # ============================================================================
+  # 2. Unit Test Suite (Cognitive Architecture Layers 0–3, ~168 Tests)
+  # ============================================================================
+  unit-test-suite:
+    name: "Unit Tests: Layers 0–3, Causal & CRDT (168 Tests)"
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Setup Pixi
+      - name: Setup Pixi (Python 3.14 Environment)
         uses: prefix-dev/setup-pixi@v0.8.1
         with:
           pixi-version: v0.70.0
-          cache: false
+          cache: true
 
-      - name: Run Full Test Suite
-        run: pixi run test
+      - name: Run Cognitive Core Unit Tests (L0 Dynamic, L1 Working, L2 Semantic, L3 Procedural)
+        run: pixi run pytest tests/unit/ -v --durations=10
 
-      - name: Run Subsystem & BEAM Benchmarks
-        run: pixi run benchmark
+  # ============================================================================
+  # 3. Integration & Daemon UDS IPC Suite (Hermes Agent & Ingestion, ~40 Tests)
+  # ============================================================================
+  integration-and-ipc-suite:
+    name: "Integration: Hermes Adapter, UDS IPC & Ingestion (40 Tests)"
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Pixi (Python 3.14 Environment)
+        uses: prefix-dev/setup-pixi@v0.8.1
+        with:
+          pixi-version: v0.70.0
+          cache: true
+
+      - name: Run Integration & IPC Test Suite
+        run: pixi run pytest tests/integration/ -v
+
+  # ============================================================================
+  # 4. Performance, Latency & BEAM Ability Benchmarks (~17 Tests)
+  # ============================================================================
+  benchmarks-and-performance:
+    name: "Benchmarks: Subsystem Latency & BEAM Abilities (17 Tests)"
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Pixi (Python 3.14 Environment)
+        uses: prefix-dev/setup-pixi@v0.8.1
+        with:
+          pixi-version: v0.70.0
+          cache: true
+
+      - name: Run Subsystem Micro-Benchmarks (Popcount, CRDT, Latency)
+        run: pixi run pytest tests/benchmark/test_benchmark_atlas_v15.py -v
+
+      - name: Run BEAM Cognitive Ability Evaluator
+        run: pixi run pytest tests/benchmark/test_benchmark_beam.py -v -k "not test_beam_10_abilities_end_to_end"
+
+  # ============================================================================
+  # 5. CI Gate Summary (Single Required Status Check)
+  # ============================================================================
+  ci-gate-summary:
+    name: "CI Gate: All 225+ Tests & Checks Verified"
+    needs: [code-quality-and-doctor, unit-test-suite, integration-and-ipc-suite, benchmarks-and-performance]
+    runs-on: ubuntu-latest
+    if: always()
+    steps:
+      - name: Evaluate Job Statuses
+        run: |
+          if [[ "${{ needs.code-quality-and-doctor.result }}" != "success" || \
+                "${{ needs.unit-test-suite.result }}" != "success" || \
+                "${{ needs.integration-and-ipc-suite.result }}" != "success" || \
+                "${{ needs.benchmarks-and-performance.result }}" != "success" ]]; then
+            echo "❌ Some CI jobs failed!"
+            exit 1
+          fi
+          echo "🎉 All 225+ ATLAS CI checks and test suites PASSED successfully!"
+

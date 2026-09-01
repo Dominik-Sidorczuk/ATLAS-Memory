@@ -66,14 +66,43 @@ class VerifiedKVStore:
                 )
             """)
 
-            # Inicjalizacja _prev_hash na podstawie ostatniego wpisu w bazie (jeśli istnieje)
+            # Sprawdź dostępne kolumny w state_audit_log
             cursor = self._conn.cursor()
+            cursor.execute("PRAGMA table_info(state_audit_log)")
+            self._audit_cols = {row["name"] for row in cursor.fetchall()}
+
+            # Inicjalizacja _prev_hash na podstawie ostatniego wpisu w bazie (jeśli istnieje)
             cursor.execute("SELECT entry_hash FROM state_audit_log ORDER BY seq DESC LIMIT 1")
             row = cursor.fetchone()
             if row and row["entry_hash"]:
                 self._prev_hash = row["entry_hash"]
             else:
                 self._prev_hash = "0" * 64
+
+    def _insert_audit_entry_sync(
+        self,
+        cursor: sqlite3.Cursor,
+        seq: int,
+        timestamp: float,
+        key: str,
+        val_hash: str,
+        prev_h: str,
+        entry_hash: str,
+        val_json: str,
+        confidence: float,
+        reason: str = "update",
+    ) -> None:
+        """Wstawia wpis do audit logu z zachowaniem zgodności wstecznej schematu."""
+        if "new_value" in getattr(self, "_audit_cols", set()):
+            cursor.execute("""
+                INSERT INTO state_audit_log (seq, timestamp, key, value_hash, prev_hash, entry_hash, new_value, confidence, reason)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (seq, timestamp, key, val_hash, prev_h, entry_hash, val_json, confidence, reason))
+        else:
+            cursor.execute("""
+                INSERT INTO state_audit_log (seq, timestamp, key, value_hash, prev_hash, entry_hash)
+                VALUES (?, ?, ?, ?, ?, ?)
+            """, (seq, timestamp, key, val_hash, prev_h, entry_hash))
 
     async def append_audit_log(self, entry: Dict[str, Any]) -> str:
         """
@@ -212,11 +241,9 @@ class VerifiedKVStore:
             payload_str = f"{next_seq}:{now}:{key}:{val_hash}:{prev_h}"
             entry_hash = hashlib.sha256(payload_str.encode("utf-8")).hexdigest()
 
-            cursor.execute("""
-                INSERT INTO state_audit_log (seq, timestamp, key, value_hash, prev_hash, entry_hash)
-                VALUES (?, ?, ?, ?, ?, ?)
-            """, (next_seq, now, key, val_hash, prev_h, entry_hash))
-
+            self._insert_audit_entry_sync(
+                cursor, next_seq, now, key, val_hash, prev_h, entry_hash, val_json, confidence, reason
+            )
             self._prev_hash = entry_hash
             self._conn.commit()
 
@@ -272,6 +299,63 @@ class VerifiedKVStore:
                 }
                 for row in rows
             }
+
+    def set_sync(
+        self,
+        key: str,
+        value: Any,
+        confidence: float = 1.0,
+        metadata: Optional[Dict[str, Any]] = None,
+        reason: str = "update",
+    ) -> None:
+        """Synchronous version of set_state for sync ingest & UDS handlers."""
+        val_json = json.dumps(value, default=str)
+        meta_json = json.dumps(metadata or {}, default=str)
+        now = time.time()
+
+        assert self._conn is not None
+        with self._conn:
+            cursor = self._conn.cursor()
+            cursor.execute("""
+                INSERT INTO state_variables (key, value, confidence, timestamp, metadata)
+                VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(key) DO UPDATE SET
+                    value = excluded.value,
+                    confidence = excluded.confidence,
+                    timestamp = excluded.timestamp,
+                    metadata = excluded.metadata
+            """, (key, val_json, confidence, now, meta_json))
+
+            val_hash = hashlib.sha256(val_json.encode("utf-8")).hexdigest()
+            cursor.execute("SELECT IFNULL(MAX(seq), 0) + 1 AS next_seq FROM state_audit_log")
+            next_seq = cursor.fetchone()["next_seq"]
+            prev_h = self._prev_hash
+            payload_str = f"{next_seq}:{now}:{key}:{val_hash}:{prev_h}"
+            entry_hash = hashlib.sha256(payload_str.encode("utf-8")).hexdigest()
+
+            self._insert_audit_entry_sync(
+                cursor, next_seq, now, key, val_hash, prev_h, entry_hash, val_json, confidence, reason
+            )
+            self._prev_hash = entry_hash
+
+    def get_all_sync(self) -> Dict[str, Any]:
+        """Synchronous version of get_all_states."""
+        assert self._conn is not None
+        cursor = self._conn.cursor()
+        cursor.execute("SELECT key, value, confidence, timestamp, metadata FROM state_variables")
+        rows = cursor.fetchall()
+        return {
+            row["key"]: {
+                "value": json.loads(row["value"]),
+                "confidence": row["confidence"],
+                "timestamp": row["timestamp"],
+            }
+            for row in rows
+        }
+
+    # Aliases
+    set = set_sync
+    get_all = get_all_sync
 
     async def close(self) -> None:
         async with self._lock:

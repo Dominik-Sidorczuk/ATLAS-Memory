@@ -2,6 +2,7 @@
 Hermes Integration Subpackage for ATLAS Memory Provider and Session Hooks.
 """
 
+from atlas_memory.hermes.atlas_provider import AtlasMemoryProvider
 from atlas_memory.hermes.prefix_guard import HermesSessionHook, PrefixCacheGuard
 from atlas_memory.hermes.tools import (
     COMMIT_OBSERVATION_SCHEMA,
@@ -11,6 +12,7 @@ from atlas_memory.hermes.tools import (
 )
 
 __all__ = [
+    "AtlasMemoryProvider",
     "PrefixCacheGuard",
     "HermesSessionHook",
     "SEARCH_MEMORY_SCHEMA",

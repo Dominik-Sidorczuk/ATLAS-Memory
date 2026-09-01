@@ -5,13 +5,13 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import struct
 import threading
 from pathlib import Path
 from typing import Any, Dict, Optional
 
-from atlas_memory.server.atlas_daemon import DEFAULT_SOCKET_PATH
-from atlas_memory.server.models import JSONRPCRequest, JSONRPCResponse
+from atlas_memory.server.models import DEFAULT_SOCKET_PATH, JSONRPCRequest, JSONRPCResponse
 
 logger = logging.getLogger(__name__)
 
@@ -137,6 +137,55 @@ class AtlasDaemonClient:
             return isinstance(res, dict) and res.get("status") == "ok"
         except Exception:
             return False
+
+
+def send_uds_request_sync(
+    socket_path: Path | str = DEFAULT_SOCKET_PATH,
+    method: str = "ping",
+    params: Optional[Dict[str, Any]] = None,
+    timeout: float = 5.0,
+) -> Optional[Any]:
+    """Sends a synchronous JSON-RPC 2.0 request over UDS using blocking standard socket."""
+    sock_p = str(socket_path)
+    if not os.path.exists(sock_p):
+        return None
+
+    import socket
+
+    req = {"jsonrpc": "2.0", "method": method, "params": params or {}, "id": 1}
+    payload_bytes = json.dumps(req).encode("utf-8")
+    header = struct.pack(">I", len(payload_bytes))
+
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    s.settimeout(timeout)
+    try:
+        s.connect(sock_p)
+        s.sendall(header + payload_bytes)
+
+        len_raw = s.recv(4)
+        if len(len_raw) < 4:
+            return None
+        (resp_len,) = struct.unpack(">I", len_raw)
+
+        chunks = []
+        bytes_received = 0
+        while bytes_received < resp_len:
+            chunk = s.recv(min(4096, resp_len - bytes_received))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            bytes_received += len(chunk)
+
+        resp_data = b"".join(chunks)
+        resp_dict = json.loads(resp_data.decode("utf-8"))
+        if "error" in resp_dict and resp_dict["error"]:
+            return None
+        return resp_dict.get("result")
+    except Exception as exc:
+        logger.debug("send_uds_request_sync error: %s", exc)
+        return None
+    finally:
+        s.close()
 
 
 def get_or_create_client(

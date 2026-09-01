@@ -311,9 +311,11 @@ class RetroCausalEngine:
                 adj[u] = []
             adj[u].append({"target": v, "predicate": pred, "confidence": conf})
 
-        # 3. DFS / BFS szukanie ścieżek o długości do `depth`
+        # 3. DFS / BFS szukanie ścieżek o długości do `depth` z korzeni dopasowanych
         paths: List[CausalPath] = []
-        visited_nodes: Set[str] = {entity}
+        roots = subgraph_data.get("active_roots", [entity])
+        if not roots:
+            roots = [entity]
 
         # Opcjonalna ekstrapolacja z L1 JEPA
         jepa_divergence = None
@@ -330,7 +332,9 @@ class RetroCausalEngine:
             except Exception:
                 jepa_divergence = None
 
-        def dfs_traverse(current_node: str, current_steps: List[CausalEdge], current_conf: float, current_depth: int):
+        seen_path_signatures: Set[str] = set()
+
+        def dfs_traverse(root_node: str, current_node: str, current_steps: List[CausalEdge], current_conf: float, current_depth: int, visited: Set[str]):
             if current_depth > depth:
                 return
 
@@ -340,7 +344,7 @@ class RetroCausalEngine:
                 pred = edge_info["predicate"]
                 conf = edge_info["confidence"]
 
-                if tgt in visited_nodes and tgt != current_node:
+                if tgt in visited:
                     continue  # Unikanie cykli
 
                 step = CausalEdge(
@@ -364,23 +368,27 @@ class RetroCausalEngine:
                     risk = "LOW"
 
                 desc = f"Akcja '{action}' na '{entity}' wpływa na '{tgt}' przez relację '{pred}' (ufność: {new_conf:.2f})"
+                sig = f"{root_node}->{pred}->{tgt}"
 
-                paths.append(CausalPath(
-                    source_entity=entity,
-                    simulated_action=action,
-                    steps=new_steps,
-                    affected_target=tgt,
-                    cumulative_confidence=new_conf,
-                    risk_level=risk,
-                    jepa_latent_divergence=jepa_divergence,
-                    description=desc,
-                ))
+                if sig not in seen_path_signatures:
+                    seen_path_signatures.add(sig)
+                    paths.append(CausalPath(
+                        source_entity=root_node,
+                        simulated_action=action,
+                        steps=new_steps,
+                        affected_target=tgt,
+                        cumulative_confidence=new_conf,
+                        risk_level=risk,
+                        jepa_latent_divergence=jepa_divergence,
+                        description=desc,
+                    ))
 
-                visited_nodes.add(tgt)
-                dfs_traverse(tgt, new_steps, new_conf, current_depth + 1)
-                visited_nodes.remove(tgt)
+                visited.add(tgt)
+                dfs_traverse(root_node, tgt, new_steps, new_conf, current_depth + 1, visited)
+                visited.remove(tgt)
 
-        dfs_traverse(entity, [], 1.0, 1)
+        for r_node in roots:
+            dfs_traverse(r_node, r_node, [], 1.0, 1, {r_node})
 
         # Sortowanie według ryzyka i pewności
         paths.sort(key=lambda p: (p.risk_level == "CRITICAL", p.risk_level == "HIGH", p.cumulative_confidence), reverse=True)

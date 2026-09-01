@@ -73,9 +73,15 @@ log "Generowanie wrappera do ${PLUGIN_DIR}..."
 # plugin.yaml — manifest pluginu
 cat > "${PLUGIN_DIR}/plugin.yaml" <<'YAML'
 name: atlas
-version: 0.1.0
-description: "ATLAS Memory Provider for Hermes — 6 levers of memory policy orchestrating Mnemosyne store with cache contracts, epistemic ranking, and shadow reconciliation."
-author: LOOP Team
+version: 1.0.0
+description: "ATLAS Cognitive Memory Sidecar for Hermes — Zero-GIL Python 3.14 Micro-Daemon with Verified KV Ledger, Kùzu Graph, RaBitQ Vector Store, Retro-Causal What-If, and Active Sensing."
+author: Dominik Sidorczuk
+provides_tools:
+  - atlas_recall
+  - atlas_remember
+  - atlas_what_if
+  - atlas_active_sensing
+  - atlas_stats
 provides_hooks:
   - pre_llm_call
   - on_session_start
@@ -92,7 +98,11 @@ installed in the pixi env (site-packages). Survives hermes upgrade.
 """
 from __future__ import annotations
 
+import logging
+import os
+import subprocess
 import sys as _sys
+import time
 from pathlib import Path as _Path
 
 # Metadata used by hermes plugin status/loader.
@@ -117,35 +127,84 @@ except ImportError:
     MemoryProvider = object  # type: ignore
 
 
-_ATLAS_HOME = _Path.home() / ".hermes" / "atlas"
+_SOCKET_PATH = _Path.home() / ".hermes" / "atlas.sock"
+_LAUNCHER_SCRIPT = _Path(_SRC).parent / "scripts" / "atlas_daemon_launcher.py"
+_PIXI_BIN = _Path.home() / ".pixi" / "bin" / "pixi"
+if not _PIXI_BIN.exists():
+    _PIXI_BIN = "pixi"
+
+
+def _is_daemon_alive() -> bool:
+    """Verifies that the daemon is actively responding to JSON-RPC ping over UDS."""
+    try:
+        from atlas_memory.server.client import send_uds_request_sync
+        res = send_uds_request_sync(_SOCKET_PATH, method="ping", timeout=0.2)
+        return isinstance(res, dict) and res.get("status") == "ok"
+    except Exception:
+        return False
+
+
+def _ensure_daemon_running() -> None:
+    """Spawns AtlasDaemon in Python 3.14 via Pixi if not already responding."""
+    if _is_daemon_alive():
+        return
+    try:
+        logging.getLogger("atlas-plugin").info("Spawning ATLAS daemon in background...")
+        try:
+            if _SOCKET_PATH.exists():
+                _SOCKET_PATH.unlink(missing_ok=True)
+            pid_file = _SOCKET_PATH.with_suffix(".pid")
+            if pid_file.exists():
+                pid_file.unlink(missing_ok=True)
+        except Exception:
+            pass
+
+        repo_dir = _Path(_SRC).parent
+        log_file = _Path.home() / ".hermes" / "atlas" / "daemon.log"
+        log_file.parent.mkdir(parents=True, exist_ok=True)
+        log_fp = open(str(log_file), "a", encoding="utf-8")
+        subprocess.Popen(
+            [str(_PIXI_BIN), "run", "python", str(_LAUNCHER_SCRIPT)],
+            cwd=str(repo_dir),
+            stdout=log_fp,
+            stderr=log_fp,
+            start_new_session=True,
+        )
+        for _ in range(40):
+            if _is_daemon_alive():
+                logging.getLogger("atlas-plugin").info("ATLAS daemon successfully spawned and responding on UDS")
+                break
+            time.sleep(0.05)
+    except Exception as exc:
+        logging.getLogger("atlas-plugin").warning("Could not auto-spawn ATLAS daemon: %s", exc)
+
 
 
 def register(ctx):
-    """Hermes plugin contract — register ATLAS as memory provider.
-
-    Hermes calls register(ctx) where ctx is a _ProviderCollector with
-    ctx.register_memory_provider(provider) method.
-    """
+    """Hermes plugin contract — register ATLAS memory provider and first-class tools."""
     try:
-        # ATLAS backend: HybridMemoryEngine + Orchestrator
-        from atlas_memory.engine import HybridMemoryEngine
-        from atlas_memory.orchestrator import MemoryOrchestrator
-
-        _ATLAS_HOME.mkdir(parents=True, exist_ok=True)
-
-        engine = HybridMemoryEngine.create_default(
-            db_path=str(_ATLAS_HOME / "atlas.db"),
-            qdrant_location=str(_ATLAS_HOME / "qdrant"),
-        )
-        orchestrator = MemoryOrchestrator(engine=engine)
-
-        provider = AtlasMemoryProvider(orchestrator=orchestrator)
+        _ensure_daemon_running()
+        provider = AtlasMemoryProvider(socket_path=str(_SOCKET_PATH))
         ctx.register_memory_provider(provider)
+        logging.getLogger("atlas-plugin").info("ATLAS MemoryProvider successfully registered via UDS (%s)", _SOCKET_PATH)
     except Exception as exc:
-        import logging
-        logging.getLogger("atlas-plugin").warning("ATLAS register failed: %s", exc)
-        # Fallback: register bare provider (functional passthrough)
+        logging.getLogger("atlas-plugin").warning("ATLAS register provider failed: %s", exc)
         ctx.register_memory_provider(AtlasMemoryProvider())
+
+    try:
+        from atlas_memory.hermes import tools as _atlas_tools
+
+        handlers = _atlas_tools.create_uds_tool_handlers(socket_path=_SOCKET_PATH)
+
+        if hasattr(ctx, "register_tool"):
+            ctx.register_tool(name="atlas_recall", toolset="atlas", schema=_atlas_tools.ATLAS_RECALL_SCHEMA, handler=handlers["atlas_recall"])
+            ctx.register_tool(name="atlas_remember", toolset="atlas", schema=_atlas_tools.ATLAS_REMEMBER_SCHEMA, handler=handlers["atlas_remember"])
+            ctx.register_tool(name="atlas_what_if", toolset="atlas", schema=_atlas_tools.ATLAS_WHAT_IF_SCHEMA, handler=handlers["atlas_what_if"])
+            ctx.register_tool(name="atlas_active_sensing", toolset="atlas", schema=_atlas_tools.ATLAS_ACTIVE_SENSING_SCHEMA, handler=handlers["atlas_active_sensing"])
+            ctx.register_tool(name="atlas_stats", toolset="atlas", schema=_atlas_tools.ATLAS_STATS_SCHEMA, handler=handlers["atlas_stats"])
+            logging.getLogger("atlas-plugin").info("ATLAS first-class tools registered")
+    except Exception as exc:
+        logging.getLogger("atlas-plugin").warning("Could not register ATLAS tools in ctx: %s", exc)
 
 PYTHON
 
@@ -167,7 +226,15 @@ else
   log "⚠ Pixi site-packages nie znaleziono — lewery C/Rust (numba/kuzu/qdrant) niedostępne"
 fi
 
-log "✓ Wrapper wygenerowany"
+# Instalacja skillu do ~/.hermes/skills/memory/atlas-cognitive-sidecar/
+HERMES_SKILLS_DIR="${HERMES_SKILLS_DIR:-$HOME/.hermes/skills}"
+if [[ -d "${REPO_ROOT}/skills/atlas-cognitive-sidecar" ]]; then
+  mkdir -p "${HERMES_SKILLS_DIR}/memory/atlas-cognitive-sidecar"
+  cp -r "${REPO_ROOT}/skills/atlas-cognitive-sidecar/"* "${HERMES_SKILLS_DIR}/memory/atlas-cognitive-sidecar/"
+  log "✓ Skill atlas-cognitive-sidecar zainstalowany w ${HERMES_SKILLS_DIR}/memory/atlas-cognitive-sidecar"
+fi
+
+log "✓ Wrapper i Skill wygenerowane"
 
 # --- 2. Aktywuj jeśli zażądano
 if [[ $ACTIVATE -eq 1 ]]; then

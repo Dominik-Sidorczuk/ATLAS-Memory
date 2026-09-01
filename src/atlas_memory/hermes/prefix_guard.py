@@ -3,11 +3,18 @@ from __future__ import annotations
 import json
 import logging
 import time
-from typing import Any, Dict, List, Optional
+from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
-from atlas_memory.engine import HybridMemoryEngine
-from atlas_memory.l3_procedural.skill_compiler import SafetyViolationError, compile_sop_to_skill
-from atlas_memory.l3_procedural.sleep_baker import StandardProcedure
+if TYPE_CHECKING:
+    from atlas_memory.engine import HybridMemoryEngine
+    from atlas_memory.l3_procedural.sleep_baker import StandardProcedure
+
+try:
+    from atlas_memory.l3_procedural.skill_compiler import SafetyViolationError, compile_sop_to_skill
+except ImportError:
+    SafetyViolationError = Exception  # type: ignore
+    compile_sop_to_skill = None  # type: ignore
+
 from atlas_memory.models import ConsolidationStats
 
 logger = logging.getLogger(__name__)
@@ -131,8 +138,9 @@ class HermesSessionHook:
                     logger.info("Auto-propose skill compilation for %s", sop.name)
                     proposed.append(sop.procedure_id)
                     try:
-                        compile_sop_to_skill(sop)
-                        logger.info("Compiled skill: %s", sop.procedure_id)
+                        if compile_sop_to_skill is not None:
+                            compile_sop_to_skill(sop)
+                            logger.info("Compiled skill: %s", sop.procedure_id)
                     except SafetyViolationError as e:
                         logger.warning("Unsafe SOP %s rejected during auto-propose: %s", sop.procedure_id, e)
                     except Exception as e:

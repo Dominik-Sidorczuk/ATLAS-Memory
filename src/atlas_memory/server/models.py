@@ -1,10 +1,10 @@
-"""Pydantic models for JSON-RPC 2.0 over Unix Domain Socket."""
-
-from __future__ import annotations
-
+from pathlib import Path
 from typing import Any, Dict, Optional, Union
 
 from pydantic import BaseModel, Field
+
+DEFAULT_SOCKET_PATH = Path.home() / ".hermes" / "atlas.sock"
+DEFAULT_PID_PATH = Path.home() / ".hermes" / "atlas.pid"
 
 
 class JSONRPCError(BaseModel):

@@ -5,6 +5,7 @@ import logging
 import os
 import shutil
 import tempfile
+import time
 from typing import Any, Dict, List, Optional, Set
 
 import networkx as nx
@@ -73,47 +74,84 @@ class KuzuGraphStore:
         except Exception as exc:
             logger.debug("Kuzu schema (rel table): %s", exc)
 
+    def add_entity(self, name: str, entity_type: str = "entity") -> None:
+        """Synchronously adds a node to NetworkX and Kùzu graph."""
+        self.nx_graph.add_node(name, type=entity_type)
+        if self.conn is not None:
+            try:
+                self.conn.execute(
+                    "MERGE (e:Entity {name: $name}) ON CREATE SET e.entity_type = $etype",
+                    {"name": name, "etype": entity_type},
+                )
+            except Exception as exc:
+                logger.debug("Kuzu add_entity error: %s", exc)
+
+    def add_relation(
+        self,
+        subject: str,
+        predicate: str,
+        object: str,
+        confidence: float = 1.0,
+        timestamp: Optional[float] = None,
+    ) -> None:
+        """Synchronously adds a relation edge between subject and object."""
+        ts = time.time() if timestamp is None else timestamp
+        self.nx_graph.add_node(subject, type="entity")
+        self.nx_graph.add_node(object, type="entity_or_value")
+        self.nx_graph.add_edge(
+            subject,
+            object,
+            predicate=predicate,
+            confidence=confidence,
+            timestamp=ts,
+        )
+        if self.conn is not None:
+            try:
+                self.conn.execute(
+                    "MERGE (e:Entity {name: $name}) ON CREATE SET e.entity_type = 'entity'",
+                    {"name": subject},
+                )
+                self.conn.execute(
+                    "MERGE (e:Entity {name: $name}) ON CREATE SET e.entity_type = 'entity_or_val'",
+                    {"name": object},
+                )
+                self.conn.execute("""
+                    MATCH (u:Entity), (v:Entity)
+                    WHERE u.name = $u_name AND v.name = $v_name
+                    CREATE (u)-[:RELATION {predicate: $pred, confidence: $conf, timestamp: $ts}]->(v)
+                """, {
+                    "u_name": subject,
+                    "v_name": object,
+                    "pred": predicate,
+                    "conf": confidence,
+                    "ts": ts,
+                })
+            except Exception as exc:
+                logger.debug("Kuzu add_relation error: %s", exc)
+
+    def add_record_sync(self, record: MemoryRecord) -> None:
+        """Synchronous record addition wrapper."""
+        self.add_relation(
+            record.effective_subject,
+            record.predicate,
+            str(record.object)[:80],
+            confidence=float(record.confidence),
+            timestamp=float(record.timestamp),
+        )
+
     async def add_record(self, record: MemoryRecord) -> None:
-        subj = record.effective_subject
-        obj = str(record.object)
-        pred = record.predicate
-        conf = float(record.confidence)
-        ts = float(record.timestamp)
-
+        """Asynchronous record addition."""
         async with self._lock:
-            # 1. Aktualizacja grafu NetworkX w pamięci
-            self.nx_graph.add_node(subj, type="entity")
-            self.nx_graph.add_node(obj, type="entity_or_value")
-            self.nx_graph.add_edge(
-                subj,
-                obj,
-                predicate=pred,
-                confidence=conf,
-                timestamp=ts,
-                is_state_variable=record.is_state_variable,
-            )
+            self.add_record_sync(record)
 
-            # 2. Zapis w bazie Kùzu za pomocą zapytań Cypher
-            if self.conn is not None:
-                try:
-                    self.conn.execute("MERGE (e:Entity {name: $name}) ON CREATE SET e.entity_type = 'entity'", {"name": subj})
-                    self.conn.execute("MERGE (e:Entity {name: $name}) ON CREATE SET e.entity_type = 'entity_or_val'", {"name": obj})
-                    self.conn.execute("""
-                        MATCH (u:Entity), (v:Entity)
-                        WHERE u.name = $u_name AND v.name = $v_name
-                        CREATE (u)-[:RELATION {predicate: $pred, confidence: $conf, timestamp: $ts}]->(v)
-                    """, {
-                        "u_name": subj,
-                        "v_name": obj,
-                        "pred": pred,
-                        "conf": conf,
-                        "ts": ts,
-                    })
-                except Exception as exc:
-                    # Fix atlas-v5: nie maskuj błędów persystencji Kuzu — loguj,
-                    # żeby było wiadomo, że dyskowa warstwa grafu nie działa
-                    # (graf NetworkX w pamięci i tak został zaktualizowany).
-                    logger.warning("Kuzu persistence failed: %s", exc)
+    def close(self) -> None:
+        """Closes Kuzu connection and releases resources."""
+        if self.conn is not None:
+            try:
+                self.conn = None
+                self.db = None
+            except Exception:
+                pass
 
     async def get_subgraph_relations(
         self,
@@ -122,17 +160,36 @@ class KuzuGraphStore:
     ) -> Dict[str, Any]:
         async with self._lock:
             subgraph_nodes: Set[str] = set()
-            for entity in active_entities:
-                if entity in self.nx_graph:
-                    subgraph_nodes.add(entity)
-                    succ_1 = set(self.nx_graph.successors(entity))
-                    pred_1 = set(self.nx_graph.predecessors(entity))
-                    subgraph_nodes.update(succ_1 | pred_1)
+            matched_roots: Set[str] = set()
 
-                    if max_depth >= 2:
-                        for neighbor in (succ_1 | pred_1):
-                            subgraph_nodes.update(self.nx_graph.successors(neighbor))
-                            subgraph_nodes.update(self.nx_graph.predecessors(neighbor))
+            for entity in active_entities:
+                if not entity:
+                    continue
+                # 1. Exact match
+                if entity in self.nx_graph:
+                    matched_roots.add(entity)
+
+                # 2. Case-insensitive & token/substring matching
+                ent_clean = str(entity).strip().lower().replace("_", " ")
+                ent_tokens = set(w for w in ent_clean.split() if len(w) >= 2)
+
+                for node in self.nx_graph.nodes:
+                    node_str = str(node).strip().lower()
+                    if node_str == ent_clean or ent_clean in node_str or node_str in ent_clean:
+                        matched_roots.add(node)
+                    elif ent_tokens and any(t in node_str for t in ent_tokens):
+                        matched_roots.add(node)
+
+            for root in matched_roots:
+                subgraph_nodes.add(root)
+                succ_1 = set(self.nx_graph.successors(root))
+                pred_1 = set(self.nx_graph.predecessors(root))
+                subgraph_nodes.update(succ_1 | pred_1)
+
+                if max_depth >= 2:
+                    for neighbor in (succ_1 | pred_1):
+                        subgraph_nodes.update(self.nx_graph.successors(neighbor))
+                        subgraph_nodes.update(self.nx_graph.predecessors(neighbor))
 
             sub_g = self.nx_graph.subgraph(subgraph_nodes)
             edges_list = []
@@ -146,7 +203,7 @@ class KuzuGraphStore:
                 })
 
             return {
-                "active_roots": active_entities,
+                "active_roots": list(matched_roots) if matched_roots else active_entities,
                 "matched_nodes_count": len(subgraph_nodes),
                 "nodes": list(subgraph_nodes),
                 "relations": edges_list,

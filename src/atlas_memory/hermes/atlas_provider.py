@@ -29,23 +29,34 @@ import re
 import threading
 import time
 from datetime import datetime
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
 
-# Opcjonalny import — provider musi działać nawet gdy ATLAS niedostępny
 try:
     from atlas_memory.models import EpistemicSource, MemoryRecord
+except ImportError:
+    EpistemicSource = None  # type: ignore[assignment,misc]
+    MemoryRecord = None  # type: ignore[assignment,misc]
+
+try:
+    from atlas_memory.server.client import (
+        AtlasDaemonClient,
+        get_or_create_client,
+        send_uds_request_sync,
+    )
+except ImportError:
+    AtlasDaemonClient = None  # type: ignore[assignment,misc]
+    get_or_create_client = None  # type: ignore[assignment,misc]
+    send_uds_request_sync = None  # type: ignore[assignment,misc]
+
+try:
     from atlas_memory.orchestrator import MemoryOrchestrator
-    from atlas_memory.server.client import AtlasDaemonClient, get_or_create_client
     ATLAS_AVAILABLE = True
 except ImportError:
     ATLAS_AVAILABLE = False
-    EpistemicSource = None  # type: ignore[assignment,misc]
-    MemoryRecord = None  # type: ignore[assignment,misc]
-    AtlasDaemonClient = None  # type: ignore[assignment,misc]
-    get_or_create_client = None  # type: ignore[assignment,misc]
-    logger.warning("ATLAS atlas_memory nie jest importowalny — AtlasMemoryProvider działa w trybie passthrough")
+    MemoryOrchestrator = None  # type: ignore[assignment,misc]
 
 try:
     from agent.memory_provider import MemoryProvider, RecallStatus, is_trivial_prompt
@@ -191,11 +202,8 @@ class AtlasMemoryProvider(MemoryProvider):  # type: ignore[misc]
         orchestrator: Optional[MemoryOrchestrator] = None,
         socket_path: Optional[str] = None,
     ) -> None:
-        if not ATLAS_AVAILABLE and orchestrator is None:
-            raise RuntimeError("ATLAS nie jest zainstalowany — uruchom 'uv sync' w LOOP/Memory")
-
         self._orchestrator = orchestrator
-        self._socket_path = socket_path
+        self._socket_path = socket_path or os.environ.get("ATLAS_SOCKET_PATH", str(Path.home() / ".hermes" / "atlas.sock"))
         self._mnemosyne = None
         if MNEMOSYNE_DELEGATE is not None:
             try:
@@ -210,34 +218,27 @@ class AtlasMemoryProvider(MemoryProvider):  # type: ignore[misc]
 
     def get_client(self) -> Optional[Any]:
         """Returns thread-local AtlasDaemonClient if available."""
-        if not ATLAS_AVAILABLE or get_or_create_client is None:
+        if get_or_create_client is None:
             return None
         return get_or_create_client(self._socket_path) if self._socket_path else get_or_create_client()
 
     def _call_uds_sync(self, method: str, params: Optional[Dict[str, Any]] = None) -> Optional[Any]:
         """Executes sync JSON-RPC 2.0 call over UDS if socket is present, returns None on fallback."""
+        sock = self._socket_path or os.environ.get("ATLAS_SOCKET_PATH", str(Path.home() / ".hermes" / "atlas.sock"))
+        if not Path(sock).exists():
+            return None
+
+        if send_uds_request_sync is not None:
+            return send_uds_request_sync(sock, method, params=params or {}, timeout=0.3)
+
         client = self.get_client()
         if client is None or not client.socket_path.exists():
             return None
 
         import asyncio
-        import concurrent.futures
-
         params_dict = params or {}
-
         try:
-            try:
-                loop = asyncio.get_running_loop()
-            except RuntimeError:
-                loop = None
-
-            if loop and loop.is_running():
-                with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
-                    return pool.submit(
-                        asyncio.run, client.call(method, params_dict, timeout=client.timeout)
-                    ).result(timeout=client.timeout + 0.1)
-            else:
-                return asyncio.run(client.call(method, params_dict, timeout=client.timeout))
+            return asyncio.run(client.call(method, params_dict, timeout=client.timeout))
         except Exception as exc:
             logger.debug("UDS call %s failed, falling back to in-process: %s", method, exc)
             return None
@@ -251,7 +252,10 @@ class AtlasMemoryProvider(MemoryProvider):  # type: ignore[misc]
 
     def is_available(self) -> bool:
         """ATLAS + backend dostępne? Zero network calls."""
-        return ATLAS_AVAILABLE and (self._orchestrator is not None or MNEMOSYNE_DELEGATE is not None)
+        sock = Path(self._socket_path) if self._socket_path else Path(os.environ.get("ATLAS_SOCKET_PATH", str(Path.home() / ".hermes" / "atlas.sock")))
+        if sock.exists():
+            return True
+        return ATLAS_AVAILABLE and (self._orchestrator is not None or self._mnemosyne is not None)
 
     def initialize(self, session_id: str = "", **kwargs) -> None:
         self._session_id = session_id or "hermes_default"
@@ -349,98 +353,111 @@ class AtlasMemoryProvider(MemoryProvider):  # type: ignore[misc]
                 self._last_prefetch = {"skipped": True, "reason": "trivial_prompt"}
             return ""
 
-        if self._orchestrator is None:
-            # Pass-through do Mnemosyne (fallback)
+        sid = session_id or self._session_id
+
+        # 1. In-process execution if orchestrator is configured
+        if self._orchestrator is not None:
+            if not ATLAS_AVAILABLE or EpistemicSource is None or MemoryRecord is None:
+                return ""
+
+            # Fix Bug 3: użyj cache'owanego wyniku z queue_prefetch jeśli dostępny
+            with self._lock:
+                queued = self._queued_context
+                if queued:
+                    self._queued_context = None  # Jednorazowe użycie
+                    return queued
+
+            # ATLAS gate: czysty czat bez encji → SKIP (0 tokenów)
+            try:
+                should_run, entities, reason = self._orchestrator.should_retrieve(query, explicit_entities=None)
+            except Exception as exc:
+                logger.warning("should_retrieve failed: %s", exc)
+                with self._lock:
+                    self._last_prefetch = {"skipped": True, "reason": f"error: {exc}"}
+                return ""
+
+            if not should_run:
+                with self._lock:
+                    self._last_prefetch = {
+                        "skipped": True,
+                        "reason": reason,
+                        "tokens_saved": self._orchestrator.stats.get("tokens_saved_estimate", 0),
+                    }
+                if self._debug:
+                    logger.info("[ATLAS] prefetch SKIP: %s", reason)
+                return ""
+
+            records: List[Any] = []
             if self._mnemosyne is not None:
                 try:
-                    result = self._mnemosyne.prefetch(query, session_id=session_id or self._session_id)
-                    with self._lock:
-                        self._last_prefetch = {"skipped": False, "source": "mnemosyne_passthrough", "count": len(result)}
-                    return result
+                    raw = self._mnemosyne.prefetch(query, session_id=sid)
+                    records = _parse_mnemosyne_context(raw, fallback_query=query)
                 except Exception as exc:
-                    logger.warning("Mnemosyne passthrough failed: %s", exc)
-                    with self._lock:
-                        self._last_prefetch = {"skipped": True, "reason": f"error: {exc}"}  # Fix Bug 5
-            return ""
+                    logger.warning("Mnemosyne recall failed: %s", exc)
 
-        # Guard: jeśli ATLAS jest dostępny, EpistemicSource/MemoryRecord nie mogą być None
-        if not ATLAS_AVAILABLE or EpistemicSource is None or MemoryRecord is None:
-            return ""
+            if not records:
+                with self._lock:
+                    self._last_prefetch = {"skipped": True, "reason": "no_records_from_backend"}
+                return ""
 
-        # Fix Bug 3: użyj cache'owanego wyniku z queue_prefetch jeśli dostępny
-        with self._lock:
-            queued = self._queued_context
-            if queued:
-                self._queued_context = None  # Jednorazowe użycie
-                return queued
+            # Lever 3: Epistemic Re-Rank (SYNC — orchestrator)
+            try:
+                ranked = self._orchestrator.epistemic_rank(records, query=query)
+            except Exception as exc:
+                logger.warning("epistemic_rank failed: %s", exc)
+                with self._lock:
+                    self._last_prefetch = {"skipped": True, "reason": f"error: {exc}"}
+                return ""
 
-        # ATLAS gate: czysty czat bez encji → SKIP (0 tokenów)
-        try:
-            should_run, entities, reason = self._orchestrator.should_retrieve(query, explicit_entities=None)
-        except Exception as exc:
-            logger.warning("should_retrieve failed: %s", exc)
-            with self._lock:
-                self._last_prefetch = {"skipped": True, "reason": f"error: {exc}"}  # Fix Bug 5
-            return ""
+            # Lever 4: Token Budget (SYNC — orchestrator)
+            try:
+                budgeted = self._orchestrator.apply_token_budget(ranked, max_tokens=1500)
+            except Exception as exc:
+                logger.warning("apply_token_budget failed: %s", exc)
+                with self._lock:
+                    self._last_prefetch = {"skipped": True, "reason": f"error: {exc}"}
+                return ""
 
-        if not should_run:
+            block = budgeted.get("formatted_context", "")
             with self._lock:
                 self._last_prefetch = {
-                    "skipped": True,
-                    "reason": reason,
-                    "tokens_saved": self._orchestrator.stats.get("tokens_saved_estimate", 0),
+                    "skipped": False,
+                    "count": len(budgeted.get("selected_facts", [])),
+                    "tokens": budgeted.get("estimated_tokens", 0),
+                    "source": "atlas_orchestrator",
                 }
             if self._debug:
-                logger.info("[ATLAS] prefetch SKIP: %s", reason)
-            return ""
+                logger.info("[ATLAS] prefetch HIT: %d facts, ~%d tokens", self._last_prefetch["count"], self._last_prefetch["tokens"])
+            return block
 
-        # Retrieval: użyj Mnemosyne (delegat) jako źródła rekordów
-        # (orchestrator.recall jest async; tu sync — robimy epiRank na rekordach z Mnemosyne)
-        records: List[Any] = []
+        # 2. Production path: Fast UDS recall from AtlasDaemon (< 15 µs)
+        try:
+            uds_res = self._call_uds_sync("prefetch", {"query": query, "session_id": sid})
+            if uds_res and isinstance(uds_res, dict):
+                ctx_block = uds_res.get("context_block", "")
+                if ctx_block:
+                    with self._lock:
+                        self._last_prefetch = {
+                            "skipped": False,
+                            "count": uds_res.get("count", len(uds_res.get("records", []))),
+                            "source": "atlas_daemon_uds",
+                        }
+                    return ctx_block
+        except Exception as uds_err:
+            logger.debug("UDS prefetch call failed: %s", uds_err)
+
+        # 3. Fallback: Pass-through do Mnemosyne
         if self._mnemosyne is not None:
             try:
-                raw = self._mnemosyne.prefetch(query, session_id=session_id or self._session_id)
-                # Fix atlas-v5: zamiast kruchej heurystyki (": " / "- ") parsujemy
-                # format Mnemosyne "[ts] (importance X, source Y) [trust] content"
-                records = _parse_mnemosyne_context(raw, fallback_query=query)
+                result = self._mnemosyne.prefetch(query, session_id=sid)
+                with self._lock:
+                    self._last_prefetch = {"skipped": False, "source": "mnemosyne_passthrough", "count": len(result)}
+                return result
             except Exception as exc:
-                logger.warning("Mnemosyne recall failed: %s", exc)
-
-        if not records:
-            # Fallback: nic nie znaleziono → nie wstrzykuj szumu
-            with self._lock:
-                self._last_prefetch = {"skipped": True, "reason": "no_records_from_backend"}
-            return ""
-
-        # Lever 3: Epistemic Re-Rank (SYNC — orchestrator)
-        try:
-            ranked = self._orchestrator.epistemic_rank(records, query=query)
-        except Exception as exc:
-            logger.warning("epistemic_rank failed: %s", exc)
-            with self._lock:
-                self._last_prefetch = {"skipped": True, "reason": f"error: {exc}"}  # Fix Bug 5
-            return ""
-
-        # Lever 4: Token Budget (SYNC — orchestrator)
-        try:
-            budgeted = self._orchestrator.apply_token_budget(ranked, max_tokens=1500)
-        except Exception as exc:
-            logger.warning("apply_token_budget failed: %s", exc)
-            with self._lock:
-                self._last_prefetch = {"skipped": True, "reason": f"error: {exc}"}  # Fix Bug 5
-            return ""
-
-        block = budgeted.get("formatted_context", "")
-        with self._lock:
-            self._last_prefetch = {
-                "skipped": False,
-                "count": len(budgeted.get("selected_facts", [])),
-                "tokens": budgeted.get("estimated_tokens", 0),
-                "source": "atlas_orchestrator",
-            }
-        if self._debug:
-            logger.info("[ATLAS] prefetch HIT: %d facts, ~%d tokens", self._last_prefetch["count"], self._last_prefetch["tokens"])
-        return block
+                logger.warning("Mnemosyne passthrough failed: %s", exc)
+                with self._lock:
+                    self._last_prefetch = {"skipped": True, "reason": f"error: {exc}"}
+        return ""
 
     def queue_prefetch(self, query: str, *, session_id: str = "") -> None:
         """Background recall na NASTĘPNĄ turę. Zero opóźnienia w tej turze.
