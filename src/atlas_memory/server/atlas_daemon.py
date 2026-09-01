@@ -9,7 +9,7 @@ import os
 import signal
 import struct
 from pathlib import Path
-from typing import Any, Callable, Coroutine, Dict, Optional, Set
+from typing import Any, Callable, Coroutine, Dict, List, Optional, Set
 
 from atlas_memory.server.models import (
     DEFAULT_PID_PATH,
@@ -84,10 +84,10 @@ class AtlasDaemon:
         base_dir = Path(atlas_dir) if atlas_dir else (Path.home() / ".hermes" / "atlas")
         base_dir.mkdir(parents=True, exist_ok=True)
 
+        from atlas_memory.active.prediction_error import ActiveSensingEngine
+        from atlas_memory.causal.retro_causal_edge import RetroCausalEngine
         from atlas_memory.engine import HybridMemoryEngine
         from atlas_memory.orchestrator import MemoryOrchestrator
-        from atlas_memory.causal.retro_causal_edge import RetroCausalEngine
-        from atlas_memory.active.prediction_error import ActiveSensingEngine
         from atlas_memory.sync.crdt import DeltaCRDT
         from atlas_memory.sync.crypto import SyncCrypto
         from atlas_memory.sync.protocol import GossipProtocol

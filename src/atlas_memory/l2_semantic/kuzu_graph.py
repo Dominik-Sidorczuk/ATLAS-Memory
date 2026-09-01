@@ -146,12 +146,11 @@ class KuzuGraphStore:
 
     def close(self) -> None:
         """Closes Kuzu connection and releases resources."""
-        if self.conn is not None:
-            try:
-                self.conn = None
-                self.db = None
-            except Exception:
-                pass
+        self.conn = None
+        self.db = None
+        if getattr(self, "_temp_dir", None) and os.path.exists(self._temp_dir):
+            shutil.rmtree(self._temp_dir, ignore_errors=True)
+            self._temp_dir = None
 
     async def get_subgraph_relations(
         self,
@@ -319,13 +318,5 @@ class KuzuGraphStore:
                 self.nx_graph.remove_node(orphan)
             return len(orphans)
 
-    def close(self) -> None:
-        self.conn = None
-        self.db = None
-        if self._temp_dir and os.path.exists(self._temp_dir):
-            shutil.rmtree(self._temp_dir, ignore_errors=True)
-            self._temp_dir = None
-
     def __del__(self) -> None:
         self.close()
-

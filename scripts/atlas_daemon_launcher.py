@@ -7,6 +7,7 @@ import logging
 import os
 import sys
 from pathlib import Path
+from typing import Optional
 
 from atlas_memory.server.atlas_daemon import AtlasDaemon
 

@@ -3,12 +3,12 @@
 import asyncio
 import concurrent.futures
 from pathlib import Path
+
 import pytest
 
-from atlas_memory.ingest.mnemosyne_ingest import MnemosyneIngestEngine
+from atlas_memory.hermes.atlas_provider import AtlasMemoryProvider
 from atlas_memory.server.atlas_daemon import AtlasDaemon
 from atlas_memory.server.client import AtlasDaemonClient
-from atlas_memory.hermes.atlas_provider import AtlasMemoryProvider
 
 
 @pytest.mark.asyncio

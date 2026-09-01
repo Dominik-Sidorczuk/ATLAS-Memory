@@ -4,9 +4,9 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, Dict, Optional
 
 if TYPE_CHECKING:
-    from atlas_memory.engine import HybridMemoryEngine
+    pass
 
-from atlas_memory.models import EpistemicSource, MemoryRecord
+from atlas_memory.models import MemoryRecord
 from atlas_memory.server.client import send_uds_request_sync
 from atlas_memory.server.models import DEFAULT_SOCKET_PATH
 
