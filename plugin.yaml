@@ -1,0 +1,8 @@
+name: atlas
+version: 0.2.0
+description: "ATLAS Memory Plugin — 6-lever cognitive orchestration (Retrieval Policy Gate, Epistemic Knapsack Packing, RaBitQ Quantization, Causal Graph, BFT-CRDT Sync, Autonomous Skill Compilation). MemoryProvider contract for Hermes Agent."
+author: ATLAS Team
+provides_hooks:
+  - pre_llm_call
+  - on_session_start
+dependencies: []

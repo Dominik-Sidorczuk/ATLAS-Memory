@@ -1,0 +1,33 @@
+# Środowiska i cache pakietów
+.venv/
+.pixi/
+*.egg-info/
+dist/
+build/
+
+# Cache Pythona i testów
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.coverage
+htmlcov/
+.ruff_cache/
+
+# Pliki baz danych i logi runtime
+data/
+*.db
+*.db-wal
+*.db-shm
+*.sock
+*.pid
+
+# Wewnętrzne logi deweloperskie i gałęzie pętli
+.loop-worktrees/
+.loop_state/
+*.log
+
+# Internal LOOP Engineering governance (private, not published)
+loop-internal/
+*.zip
+
