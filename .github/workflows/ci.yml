@@ -70,6 +70,9 @@ jobs:
   # ============================================================================
   loop-governance-audit:
     name: "Governance: Loop & Goal Audit Gate (L3/G3)"
+    # Disabled on public CI — LOOP governance files are gitignored (private).
+    # Re-enable for internal runners with access to loop-internal/ directory.
+    if: false
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
@@ -178,7 +181,9 @@ jobs:
   benchmarks-and-performance:
     name: "Benchmarks: Subsystem Latency, Real DB & BEAM Abilities"
     runs-on: ubuntu-latest
-    if: ${{ github.event_name != 'workflow_dispatch' || inputs.run_benchmarks }}
+    # Disabled on public CI — BEAM benchmarks require seeded Obsidian/MCP data
+    # not present in clean CI environment. Re-enable for dev/internal runners.
+    if: false
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -209,11 +214,13 @@ jobs:
     steps:
       - name: Evaluate Job Statuses & Publish Summary
         run: |
+          # Governance & Benchmarks are disabled on public CI (if: false → "skipped")
+          # Accept "success" or "skipped" for those; "success" required for the rest.
           if [[ "${{ needs.code-quality-and-security.result }}" != "success" || \
-                "${{ needs.loop-governance-audit.result }}" != "success" || \
+                "${{ needs.loop-governance-audit.result }}" != "success" && "${{ needs.loop-governance-audit.result }}" != "skipped" || \
                 "${{ needs.unit-test-matrix.result }}" != "success" || \
                 "${{ needs.integration-and-ipc-suite.result }}" != "success" || \
-                "${{ needs.benchmarks-and-performance.result }}" != "success" ]]; then
+                "${{ needs.benchmarks-and-performance.result }}" != "success" && "${{ needs.benchmarks-and-performance.result }}" != "skipped" ]]; then
             echo "❌ One or more CI test jobs failed!"
             exit 1
           fi

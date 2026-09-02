@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "atlas-memory"
-version = "1.4.1"
+version = "1.5.0"
 description = "ATLAS Memory — 4-Layer Memory Architecture (TTT + JEPA + Hybrid Knowledge + Sleep Consolidation) with CRDT Sync, SIMD Quantization, and Autonomous Skill Compilation"
 readme = "README.md"
 requires-python = ">=3.11"
