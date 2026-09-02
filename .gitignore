@@ -31,3 +31,12 @@ data/
 loop-internal/
 *.zip
 
+
+# LOOP Engineering governance (private, not published)
+AGENTS.md
+GOAL.md
+LOOP.md
+STATE.md
+loop-*.md
+skills/loop-*
+skills/goal-verifier

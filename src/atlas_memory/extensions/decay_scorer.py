@@ -4,6 +4,8 @@ import math
 import time
 from typing import Optional
 
+import numpy as np
+
 from atlas_memory.models import MemoryRecord
 
 
@@ -60,6 +62,40 @@ class SalienceDecayEngine:
 
         score = sim_part + imp_part + rec_part + freq_part
         return float(score)
+
+    def calculate_salience_batch(
+        self,
+        records: list[MemoryRecord],
+        similarity_scores: Optional[list[float] | np.ndarray] = None,
+        current_time: Optional[float] = None,
+    ) -> np.ndarray:
+        """
+        Wektor V38: Wektoryzowane masowe obliczanie istotności (Salience Decay) dla zbioru faktów.
+        
+        Używa operacji wektorowych NumPy (np.exp, np.log1p, np.clip) eliminując pętle Pythona.
+        """
+        n = len(records)
+        if n == 0:
+            return np.empty(0, dtype=np.float32)
+
+        now = current_time if current_time is not None else time.time()
+
+        sims = np.zeros(n, dtype=np.float32) if similarity_scores is None else np.asarray(similarity_scores, dtype=np.float32)
+        sim_part = self.w_sim * np.clip(sims, 0.0, 1.0)
+
+        importances = np.array([r.importance_score for r in records], dtype=np.float32)
+        imp_part = self.w_imp * np.clip(importances, 0.0, 1.0)
+
+        timestamps = np.array([r.timestamp for r in records], dtype=np.float32)
+        dts = np.maximum(0.0, now - timestamps)
+        rec_decay = np.exp(-self.decay_lambda * dts)
+        rec_part = self.w_rec * rec_decay
+
+        access_counts = np.array([r.access_count for r in records], dtype=np.float32)
+        freq_normalized = np.minimum(1.0, np.log1p(access_counts) / self._log_norm)
+        freq_part = self.w_freq * freq_normalized
+
+        return (sim_part + imp_part + rec_part + freq_part).astype(np.float32)
 
 
     def record_access(self, record: MemoryRecord, access_time: Optional[float] = None) -> None:

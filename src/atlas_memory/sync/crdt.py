@@ -2,27 +2,31 @@
 
 from __future__ import annotations
 
+import threading
 import time
 from typing import Any, Dict, Optional, Tuple
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, PrivateAttr
 
 
 class VectorClock(BaseModel):
     """Vector Clock for tracking causal relationships across distributed agents."""
 
     clocks: Dict[str, int] = Field(default_factory=dict)
+    _lock: threading.Lock = PrivateAttr(default_factory=threading.Lock)
 
     def increment(self, node_id: str) -> None:
         """Increments the logical clock for the given node."""
-        self.clocks[node_id] = self.clocks.get(node_id, 0) + 1
+        with self._lock:
+            self.clocks[node_id] = self.clocks.get(node_id, 0) + 1
 
     def merge(self, other: VectorClock) -> VectorClock:
         """Merges another vector clock by taking the component-wise maximum."""
-        all_keys = set(self.clocks.keys()) | set(other.clocks.keys())
-        merged = {k: max(self.clocks.get(k, 0), other.clocks.get(k, 0)) for k in all_keys}
-        self.clocks = merged
-        return VectorClock(clocks=merged)
+        with self._lock:
+            all_keys = set(self.clocks.keys()) | set(other.clocks.keys())
+            merged = {k: max(self.clocks.get(k, 0), other.clocks.get(k, 0)) for k in all_keys}
+            self.clocks = merged
+            return VectorClock(clocks=merged)
 
     def happens_before(self, other: VectorClock) -> bool:
         """Returns True if this vector clock strictly happens before the other clock."""

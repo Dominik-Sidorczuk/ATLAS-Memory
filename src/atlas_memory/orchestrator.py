@@ -45,11 +45,14 @@ class MemoryOrchestrator:
         EpistemicSource.AGENT_INFERENCE: 0.50,
     }
 
-    INTENT_KEYWORDS = [
-        "jaki", "gdzie", "hasło", "konfiguracja", "ip", "port", "status", "zależności",
-        "dlaczego", "kto", "co", "parametr", "znajdź", "przypomnij", "wersja", "serwer",
-        "baza", "service", "config", "password", "where", "what", "how", "show",
-    ]
+    TRIVIAL_PROMPT_PATTERN = re.compile(
+        r"^(?:cześć|hej|witaj|siema|dzień dobry|witam|hello|hi|hey|greetings|thanks|dzięki|ok|dobrze|super|jasne|rozumiem|yes|no|tak|nie|do widzenia|do usłyszenia|na razie|narazie|trzymaj się|bye|goodbye|see you|/.*)[.!?,\s]*(?:wielkie|bardzo|za pomoc|za wszystko|do jutra|do usłyszenia|miłego dnia)?[.!?,\s]*$",
+        re.IGNORECASE,
+    )
+    CASUAL_GREETING_PATTERN = re.compile(
+        r"^(?:cześć|hej|witaj|siema|hello|hi|hey|super|dzięki|ok)\b.*(?:jak leci|jak tam|jak się|how are you|how is it going|what's up|do usłyszenia|do widzenia|za pomoc)",
+        re.IGNORECASE,
+    )
 
     def __init__(
         self,
@@ -70,7 +73,6 @@ class MemoryOrchestrator:
         self.calibrator = calibrator or (engine.calibrator if hasattr(engine, "calibrator") else EpistemicCalibrator())
         self.shadow_extractor = shadow_extractor
         self.max_retrieval_tokens = max_retrieval_tokens
-        self._intent_regex = re.compile(rf"\b(?:{'|'.join(self.INTENT_KEYWORDS)})\b", re.IGNORECASE)
 
         # Metryki operacyjne
         self.stats = {
@@ -121,6 +123,12 @@ class MemoryOrchestrator:
         self.stats["total_turns"] += 1
         msg_clean = message.lower().strip()
 
+        # 1. Filtrowanie trywialnych powitań i krótkich zwrotów konwersacyjnych (0 tokenów)
+        if self.TRIVIAL_PROMPT_PATTERN.match(msg_clean) or self.CASUAL_GREETING_PATTERN.match(msg_clean):
+            self.stats["retrieval_skipped_turns"] += 1
+            self.stats["tokens_saved_estimate"] += self.max_retrieval_tokens
+            return False, [], "conversational_turn_no_entity"
+
         detected_entities = []
         if explicit_entities:
             detected_entities.extend(self.canonicalizer.canonicalize_list(explicit_entities))
@@ -130,18 +138,48 @@ class MemoryOrchestrator:
                 if c_id not in detected_entities:
                     detected_entities.append(c_id)
 
-        has_intent = bool(self._intent_regex.search(msg_clean))
+        # 2. Dynamiczne heurystyki dla identyfikatorów kodu, encji złożonych i symboli
+        # - Identyfikatory z łącznikami/podkreśleniami (np. node-01, port_8080, redis_cache)
+        for sym in re.findall(r"\b[A-Za-z0-9]+(?:[-_][A-Za-z0-9]+)+\b", message):
+            c_sym = self.canonicalizer.canonicalize(sym)
+            if c_sym not in detected_entities and len(c_sym) >= 3:
+                detected_entities.append(c_sym)
+
+        # - Identyfikatory CamelCase (np. MemoryRecord, VectorStore, FastEmbed)
+        for camel in re.findall(r"\b[A-Z][a-z0-9]+(?:[A-Z][a-zA-Z0-9]+)+\b", message):
+            c_camel = self.canonicalizer.canonicalize(camel)
+            if c_camel not in detected_entities and len(c_camel) >= 3:
+                detected_entities.append(c_camel)
+
+        # - Terminy w backtickach (np. `cluster_config`, `active_nodes`)
+        for backtick in re.findall(r"`([^`]+)`", message):
+            c_bt = self.canonicalizer.canonicalize(backtick.strip())
+            if c_bt not in detected_entities and len(c_bt) >= 3:
+                detected_entities.append(c_bt)
+
+        # - Akronimy i terminy z wielkich liter (np. NAS, IP, GPU, DB, API, SQL)
+        for acr in re.findall(r"\b[A-Z]{2,}\b", message):
+            c_acr = self.canonicalizer.canonicalize(acr)
+            if c_acr not in detected_entities and len(c_acr) >= 2:
+                detected_entities.append(c_acr)
+
+        # - Nazwy własne i encje pisane z wielkiej litery (np. Loop, Engineering, Obsidian, Superpowers)
+        sentence_starters = {
+            "co", "czy", "jak", "gdzie", "kiedy", "dlaczego", "kto", "czym", "jaki", "jakie",
+            "what", "where", "when", "why", "how", "who", "which", "is", "are", "do", "does",
+            "super", "dzięki", "dobrze", "jasne", "ok", "cześć", "hej", "witaj", "siema", "dzień", "witam", "hello", "hi", "hey", "thanks",
+        }
+        for word in re.findall(r"\b[A-Z][a-zA-Z0-9_-]{2,}\b", message):
+            if word.lower() not in sentence_starters:
+                c_word = self.canonicalizer.canonicalize(word)
+                if c_word not in detected_entities and len(c_word) >= 3:
+                    detected_entities.append(c_word)
 
         if detected_entities:
             self.stats["retrieval_executed_turns"] += 1
             return True, detected_entities, f"entity_match: {detected_entities}"
 
-        if has_intent and len(msg_clean.split()) > 2:
-            self.stats["retrieval_executed_turns"] += 1
-            return True, [], "intent_keyword_match"
-
-
-        # Czysty czat konwersacyjny -> brak retrieval
+        # Czysty czat konwersacyjny bez encji -> brak retrieval (0 tokenów, zero szumu)
         self.stats["retrieval_skipped_turns"] += 1
         self.stats["tokens_saved_estimate"] += self.max_retrieval_tokens
         return False, [], "conversational_turn_no_entity"

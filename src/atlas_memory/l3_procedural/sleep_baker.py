@@ -1,14 +1,19 @@
 from __future__ import annotations
 
+import asyncio
 import collections
 import hashlib
 import json
+import logging
 import time
-from typing import Any, Dict, List, Optional
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Union
 
 from pydantic import BaseModel, Field
 
 from atlas_memory.l2_semantic.kv_store import VerifiedKVStore
+
+logger = logging.getLogger("atlas.sleep_baker")
 
 
 class Step(BaseModel):
@@ -19,9 +24,10 @@ class Step(BaseModel):
 
 
 class StandardProcedure(BaseModel):
-    """Standardowa Procedura Operacyjna (SOP) wyekstrahowana podczas cyklu Sleep Baking."""
+    """Skompilowana standardowa procedura operacyjna (SOP)."""
     procedure_id: str = Field(description="Unikalny identyfikator procedury")
-    name: str = Field(description="Czytelna nazwa procedury")
+    name: str = Field(default="", description="Czytelna nazwa procedury")
+    description: str = Field(default="", description="Opis procedury")
     steps: List[Step] = Field(default_factory=list, description="Uporządkowana lista kroków")
     success_rate: float = Field(default=1.0, ge=0.0, le=1.0, description="Wskaźnik sukcesu procedury")
     invocations_count: int = Field(default=1, ge=1, description="Liczba zaobserwowanych wywołań sekwencji")
@@ -32,10 +38,11 @@ class StandardProcedure(BaseModel):
 
 class SleepBaker:
     """
-    L3: Sleep Cycle Consolidation & Procedural SOP Extraction (Sleep Baking).
+    L3: Procedural Memory Sleep Baker & Trajectory Consolidator.
     
-    Analizuje trajektorie sesji agenta, grupuje powtarzające się skuteczne sekwencje narzędzi
-    (np. read_file -> patch -> pytest) i wypieka je jako Standardowe Procedury Operacyjne (SOP).
+    W fazie Offline / Sleep Cycle analizuje bufor trajektorii z warstwy L1,
+    grupuje powtarzalne sekwencje akcji i wypieka z nich Standardowe Procedury (SOP).
+    Zapisuje skompilowane procedury w L2 Verified KV Store jako bazę nawyków.
     """
 
     def __init__(
@@ -46,6 +53,7 @@ class SleepBaker:
         self.min_frequency = min_frequency
         self.min_success_rate = min_success_rate
         self.baked_sops: Dict[str, StandardProcedure] = {}
+        self._lock = asyncio.Lock()
 
     def _extract_steps_and_sig(self, raw_steps: List[Any]) -> tuple[str, List[Step]]:
         """Ekstrahuje sygnaturę oraz znormalizowane obiekty Step z surowej listy kroków/akcji."""
@@ -66,7 +74,8 @@ class SleepBaker:
                 step_objs.append(Step(tool_name=step, params_pattern={}))
                 tool_names.append(step)
             else:
-                raise NotImplementedError(f"Nieobsługiwany format kroku trajektorii: {type(step)}")
+                logger.warning("Skipping unsupported trajectory step format: %s", type(step))
+                continue
 
         signature = "->".join(tool_names)
         return signature, step_objs
@@ -165,5 +174,32 @@ class SleepBaker:
                 reason="sleep_baking_sop_compilation",
             )
 
-        self.baked_sops[procedure.procedure_id] = procedure
+        async with self._lock:
+            self.baked_sops[procedure.procedure_id] = procedure
         return payload
+
+    async def auto_consolidate_and_bake(
+        self,
+        trajectories: List[Dict[str, Any]],
+        kv_store: Optional[VerifiedKVStore] = None,
+        skills_dir: Optional[Union[str, Path]] = None,
+    ) -> List[Dict[str, Any]]:
+        """
+        Wektor V37: End-to-end automatyczna konsolidacja trajektorii i wypiekanie skilli.
+        
+        Ekstrahuje kwalifikowane SOP, zapisuje je w KV Store i kompiluje do natywnego środowiska Hermesa.
+        """
+        sops = self.konsolidacja_sesji(trajectories)
+        baked_results = []
+        for sop in sops:
+            baked = await self.bake_into_sop(sop, kv_store=kv_store)
+            if skills_dir is not None:
+                try:
+                    from atlas_memory.l3_procedural.skill_compiler import compile_and_register_sop
+                    compile_and_register_sop(sop, hermes_skills_root=Path(skills_dir))
+                    baked["skill_registered"] = True
+                except Exception as exc:
+                    logger.warning("Could not auto-compile skill for SOP %s: %s", sop.procedure_id, exc)
+                    baked["skill_registered"] = False
+            baked_results.append(baked)
+        return baked_results

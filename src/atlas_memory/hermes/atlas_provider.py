@@ -213,7 +213,8 @@ class AtlasMemoryProvider(MemoryProvider):  # type: ignore[misc]
         self._session_id = "hermes_default"
         self._lock = threading.Lock()
         self._last_prefetch: Optional[Dict[str, Any]] = None
-        self._queued_context: Optional[str] = None  # Fix Bug 3: cache z queue_prefetch
+        self._queued_context: Optional[str] = None  # Cache z queue_prefetch
+        self._queued_query: Optional[str] = None
         self._debug = os.environ.get("ATLAS_DEBUG", "0") == "1"
 
     def get_client(self) -> Optional[Any]:
@@ -259,6 +260,9 @@ class AtlasMemoryProvider(MemoryProvider):  # type: ignore[misc]
 
     def initialize(self, session_id: str = "", **kwargs) -> None:
         self._session_id = session_id or "hermes_default"
+        with self._lock:
+            self._queued_context = None
+            self._queued_query = None
         if self._mnemosyne is not None:
             try:
                 self._mnemosyne.initialize(session_id=session_id, **kwargs)
@@ -279,6 +283,9 @@ class AtlasMemoryProvider(MemoryProvider):  # type: ignore[misc]
         
         Zgodne z Hermes MemoryProvider ABC: def on_session_end(self, messages: List[Dict[str, Any]]) -> None
         """
+        with self._lock:
+            self._queued_context = None
+            self._queued_query = None
         session_id = ""
         if messages and isinstance(messages, list) and len(messages) > 0 and isinstance(messages[0], dict):
             session_id = messages[0].get("session_id", "")
@@ -360,11 +367,12 @@ class AtlasMemoryProvider(MemoryProvider):  # type: ignore[misc]
             if not ATLAS_AVAILABLE or EpistemicSource is None or MemoryRecord is None:
                 return ""
 
-            # Fix Bug 3: użyj cache'owanego wyniku z queue_prefetch jeśli dostępny
+            # Użyj cache'owanego wyniku z queue_prefetch jeśli zapytanie pasuje
             with self._lock:
-                queued = self._queued_context
-                if queued:
-                    self._queued_context = None  # Jednorazowe użycie
+                if self._queued_context and (self._queued_query is None or self._queued_query == query):
+                    queued = self._queued_context
+                    self._queued_context = None
+                    self._queued_query = None
                     return queued
 
             # ATLAS gate: czysty czat bez encji → SKIP (0 tokenów)
@@ -480,6 +488,7 @@ class AtlasMemoryProvider(MemoryProvider):  # type: ignore[misc]
             if result:
                 with self._lock:
                     self._queued_context = result
+                    self._queued_query = query
         except Exception as exc:
             logger.debug("Background prefetch failed: %s", exc)
 

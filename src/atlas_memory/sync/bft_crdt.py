@@ -43,8 +43,13 @@ class BFTLWWSet(BaseModel):
         timestamp: Optional[float] = None,
         node_id: str = "",
     ) -> bool:
-        """Dodaje element TYLKO jeśli has_quorum(signatures) i reputation.is_trusted(node_id)."""
-        ts = time.time() if timestamp is None else timestamp
+        now = time.time()
+        ts = now if timestamp is None else timestamp
+        if ts > now + 300.0:
+            self.rejected_operations.append(
+                f"REJECT_ADD: clock drift detected for element '{element}'"
+            )
+            return False
 
         # 1. Walidacja reputacji peera (jeśli silnik reputacji jest aktywny i podano node_id)
         if self.reputation is not None and node_id:
@@ -81,8 +86,13 @@ class BFTLWWSet(BaseModel):
         timestamp: Optional[float] = None,
         node_id: str = "",
     ) -> bool:
-        """Usuwa element TYLKO jeśli has_quorum(signatures) i reputation.is_trusted(node_id)."""
-        ts = time.time() if timestamp is None else timestamp
+        now = time.time()
+        ts = now if timestamp is None else timestamp
+        if ts > now + 300.0:
+            self.rejected_operations.append(
+                f"REJECT_REMOVE: clock drift detected for element '{element}'"
+            )
+            return False
 
         # 1. Walidacja reputacji peera
         if self.reputation is not None and node_id:

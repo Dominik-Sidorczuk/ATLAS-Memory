@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import random
 import time
 from typing import Dict, List, Optional
@@ -98,22 +99,53 @@ class CausalAnnealer:
             total_energy = 0.0
             total_grad = 0.0
 
-            for edge in working:
+            for i, edge in enumerate(working):
                 energy, grad = await self.energy_module.compute_edge_energy_and_gradient(
                     edge,
                     edges_context=edge_index,
                     lambda_reg=lambda_reg,
                 )
-                total_energy += energy
 
-
-                # Update: w -= eta * grad + sigma * epsilon
+                # Langevin proposal: w -= eta * grad + sigma * epsilon
                 eta = temperature
                 sigma = temperature
                 epsilon = self._rng.gauss(0.0, 1.0)
-                new_w = edge.confidence - eta * grad + sigma * epsilon
-                # Clamp do [0.0, 1.0] — zachowanie spójności
-                edge.confidence = max(0.0, min(1.0, new_w))
+                proposed_w = max(0.0, min(1.0, edge.confidence - eta * grad + sigma * epsilon))
+
+                cand_edge = edge.model_copy(update={"confidence": proposed_w})
+                cand_energy, _ = await self.energy_module.compute_edge_energy_and_gradient(
+                    cand_edge,
+                    edges_context=edge_index,
+                    lambda_reg=lambda_reg,
+                )
+
+                dE = cand_energy - energy
+                accept = False
+                if dE <= 0:
+                    accept = True
+                elif temperature < 1e-8:
+                    accept = False
+                else:
+                    exponent = -dE / temperature
+                    if exponent < -700.0:
+                        p_accept = 0.0
+                    else:
+                        p_accept = math.exp(exponent)
+                    if self._rng.random() < p_accept:
+                        accept = True
+
+                if accept:
+                    working[i] = cand_edge
+                    total_energy += cand_energy
+                    # Aktualizacja kontekstu O(1)
+                    source_list = edge_index.get(cand_edge.source, [])
+                    for idx, e_ref in enumerate(source_list):
+                        if e_ref is edge:
+                            source_list[idx] = cand_edge
+                            break
+                else:
+                    total_energy += energy
+
                 total_grad += abs(grad)
 
             energy_trace.append(total_energy)

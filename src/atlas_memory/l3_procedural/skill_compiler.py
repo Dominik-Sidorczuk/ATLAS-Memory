@@ -39,8 +39,12 @@ class ASTSafetyScanner:
             return [f"SyntaxError: {str(e)}"]
 
         for node in ast.walk(tree):
+            lineno = getattr(node, "lineno", 0)
+            # Check direct Name references (e.g. x = eval)
+            if isinstance(node, ast.Name) and node.id in self.FORBIDDEN_CALLS:
+                violations.append(f"Line {lineno}: unsafe reference to forbidden identifier '{node.id}'")
+
             if isinstance(node, ast.Call):
-                lineno = getattr(node, "lineno", 0)
                 # 1. Bare forbidden functions (e.g. eval, exec, compile, __import__)
                 if isinstance(node.func, ast.Name) and node.func.id in self.FORBIDDEN_CALLS:
                     violations.append(f"Line {lineno}: unsafe call to {node.func.id}")

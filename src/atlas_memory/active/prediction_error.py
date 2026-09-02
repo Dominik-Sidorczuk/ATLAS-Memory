@@ -82,7 +82,8 @@ class ActiveSensingEngine:
                 exp_num = float(exp_str)
                 diff = abs(obs_num - exp_num)
                 if diff > expectation.tolerance:
-                    disc_score = min(1.0, diff / max(1e-5, exp_num + expectation.tolerance))
+                    denominator = max(1e-5, abs(exp_num) + expectation.tolerance)
+                    disc_score = min(1.0, diff / denominator)
                     severity = "CRITICAL" if diff > (2.0 * expectation.tolerance) else "WARNING"
                     return PredictionError(
                         check_id=expectation.check_id,

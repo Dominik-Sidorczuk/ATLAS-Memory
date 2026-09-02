@@ -75,11 +75,11 @@ ATLAS_WHAT_IF_SCHEMA: Dict[str, Any] = {
             "properties": {
                 "entity": {
                     "type": "string",
-                    "description": "Encja wyjściowa poddawana analizie (np. 'GHK-Cu', 'ProductionDatabase')",
+                    "description": "Encja wyjściowa poddawana analizie (np. 'DatabaseCluster', 'AuthService')",
                 },
                 "action": {
                     "type": "string",
-                    "description": "Symulowana akcja (np. 'simulate_dose_increase', 'delete_cache', 'modify_schema')",
+                    "description": "Symulowana akcja (np. 'restart_service', 'delete_cache', 'modify_schema')",
                 },
                 "depth": {
                     "type": "integer",
@@ -102,15 +102,15 @@ ATLAS_ACTIVE_SENSING_SCHEMA: Dict[str, Any] = {
             "properties": {
                 "probe": {
                     "type": "string",
-                    "description": "Badany parametr lub encja (np. 'KlowStack_storage_temp', 'api_endpoint_status')",
+                    "description": "Badany parametr lub encja (np. 'database_port', 'api_endpoint_status')",
                 },
                 "expected_value": {
                     "type": "string",
-                    "description": "Oczekiwana wartość w normalnych warunkach (np. '4C', '200_OK')",
+                    "description": "Oczekiwana wartość w normalnych warunkach (np. '5432', '200_OK')",
                 },
                 "observed_value": {
                     "type": "string",
-                    "description": "Rzeczywista zaobserwowana wartość (np. '25C', '500_ERROR')",
+                    "description": "Rzeczywista zaobserwowana wartość (np. '5433', '500_ERROR')",
                 },
             },
             "required": ["probe", "observed_value"],

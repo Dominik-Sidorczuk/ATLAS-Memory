@@ -39,8 +39,8 @@ class SyncCrypto:
             cryptography.exceptions.InvalidTag: If decryption fails or data was tampered with.
             ValueError: If blob is shorter than 12 bytes.
         """
-        if len(blob) < 12:
-            raise ValueError(f"Ciphertext blob must be at least 12 bytes, got {len(blob)}")
+        if len(blob) < 28:
+            raise ValueError(f"Ciphertext blob must be at least 28 bytes (12 nonce + 16 tag), got {len(blob)}")
         nonce = blob[:12]
         ciphertext = blob[12:]
         return self._aesgcm.decrypt(nonce, ciphertext, aad)

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import threading
 import time
 from typing import Any, Dict, List, Optional, Tuple, Union
 
@@ -38,6 +39,7 @@ class TTTLayer:
         self.w_base = (rng.standard_normal((input_dim, hidden_dim)) * (1.0 / np.sqrt(input_dim))).astype(np.float64)
         self.w_ttt = np.zeros((input_dim, hidden_dim), dtype=np.float64)
         self.w_recon = (rng.standard_normal((hidden_dim, input_dim)) * (1.0 / np.sqrt(hidden_dim))).astype(np.float64)
+        self._lock = threading.Lock()
 
         # Rozgrzanie JIT (warmup)
         dummy_x = np.zeros((1, input_dim), dtype=np.float64)
@@ -60,26 +62,27 @@ class TTTLayer:
         Krok optymalizacji online TTT (synchroniczny).
         Zwraca: (loss, czas_wykonania_ms)
         """
-        start_t = time.perf_counter()
-        x_arr = np.ascontiguousarray(np.asarray(x, dtype=np.float64))
-        if x_arr.ndim == 1:
-            x_arr = x_arr.reshape(1, -1)
+        with self._lock:
+            start_t = time.perf_counter()
+            x_arr = np.ascontiguousarray(np.asarray(x, dtype=np.float64))
+            if x_arr.ndim == 1:
+                x_arr = x_arr.reshape(1, -1)
 
-        loss = numba_ttt_adapt_step(
-            x_arr,
-            self.w_base,
-            self.w_ttt,
-            self.w_recon,
-            self.lr,
-            self.weight_decay,
-        )
+            loss = numba_ttt_adapt_step(
+                x_arr,
+                self.w_base,
+                self.w_ttt,
+                self.w_recon,
+                self.lr,
+                self.weight_decay,
+            )
 
-        self.step_count += 1
-        self.total_energy += float(loss)
-        self.last_update_timestamp = time.time()
-        elapsed_ms = (time.perf_counter() - start_t) * 1000.0
+            self.step_count += 1
+            self.total_energy += float(loss)
+            self.last_update_timestamp = time.time()
+            elapsed_ms = (time.perf_counter() - start_t) * 1000.0
 
-        return float(loss), elapsed_ms
+            return float(loss), elapsed_ms
 
     async def adapt_step_async(self, x: Union[List[float], np.ndarray]) -> Tuple[float, float]:
         """Asynchroniczne wywołanie kroku TTT w puli wątków (odciążenie pętli AsyncIO)."""
@@ -90,6 +93,15 @@ class TTTLayer:
         vectors = np.ascontiguousarray(np.asarray(stream_vectors, dtype=np.float64))
         if vectors.ndim == 1:
             vectors = vectors.reshape(1, -1)
+
+        if vectors.size == 0 or vectors.shape[0] == 0:
+            return {
+                "compressed_latent": [0.0] * self.hidden_dim,
+                "mean_loss": 0.0,
+                "steps_adapted": 0,
+                "w_ttt_norm": float(np.linalg.norm(self.w_ttt)),
+                "total_adaptation_ms": 0.0,
+            }
 
         losses = []
         total_time_ms = 0.0

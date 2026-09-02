@@ -100,7 +100,8 @@ class ArrowTrajectoryBuffer:
             table = self.to_arrow_table()
             if table is not None:
                 flat = np.asarray(table["latent_vector"].combine_chunks().values)
-                return flat.reshape(-1, self.state_dim)
+                if flat.size % self.state_dim == 0 and flat.size > 0:
+                    return flat.reshape(-1, self.state_dim)
         return self.to_numpy_latent_matrix()
 
 
@@ -148,6 +149,8 @@ class ArrowTrajectoryBuffer:
                 
                 # Zero-copy extraction of nested list values
                 flat_vals = np.asarray(batch["latent_vector"].flatten())
+                if flat_vals.size % self.state_dim != 0:
+                    raise ValueError(f"Malformed latent vectors in buffer: length mismatch. Expected multiple of {self.state_dim}.")
                 latent_mat = flat_vals.reshape(-1, self.state_dim)
 
                 yield {
@@ -186,26 +189,28 @@ class ArrowTrajectoryBuffer:
         if not HAS_PYARROW:
             return
 
-        parquet_file = pq.ParquetFile(str(file_path))
-        for batch in parquet_file.iter_batches(batch_size=batch_size):
-            b_steps = np.asarray(batch["step_id"])
-            b_timestamps = np.asarray(batch["timestamp"])
-            b_actions = batch["action_name"].to_pylist()
-            b_rewards = np.asarray(batch["reward"])
-            b_uncertainties = np.asarray(batch["uncertainty"])
-            
-            flat_vals = np.asarray(batch["latent_vector"].flatten())
-            latent_mat = flat_vals.reshape(-1, state_dim)
+        with pq.ParquetFile(str(file_path)) as parquet_file:
+            for batch in parquet_file.iter_batches(batch_size=batch_size):
+                b_steps = np.asarray(batch["step_id"])
+                b_timestamps = np.asarray(batch["timestamp"])
+                b_actions = batch["action_name"].to_pylist()
+                b_rewards = np.asarray(batch["reward"])
+                b_uncertainties = np.asarray(batch["uncertainty"])
+                
+                flat_vals = np.asarray(batch["latent_vector"].flatten())
+                if flat_vals.size % state_dim != 0:
+                    raise ValueError(f"Malformed latent vectors in parquet: length mismatch. Expected multiple of {state_dim}.")
+                latent_mat = flat_vals.reshape(-1, state_dim)
 
-            yield {
-                "step_ids": b_steps,
-                "timestamps": b_timestamps,
-                "latent_matrix": latent_mat,
-                "action_names": b_actions,
-                "rewards": b_rewards,
-                "uncertainties": b_uncertainties,
-                "batch_size": len(b_steps),
-            }
+                yield {
+                    "step_ids": b_steps,
+                    "timestamps": b_timestamps,
+                    "latent_matrix": latent_mat,
+                    "action_names": b_actions,
+                    "rewards": b_rewards,
+                    "uncertainties": b_uncertainties,
+                    "batch_size": len(b_steps),
+                }
 
     def get_compression_stats(self) -> Dict[str, Any]:
         """

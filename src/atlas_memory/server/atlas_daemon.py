@@ -68,6 +68,7 @@ class AtlasDaemon:
             "telemetry_report": self._handle_telemetry_report,
             "sync_export_delta": self._handle_sync_export_delta,
             "sync_apply_delta": self._handle_sync_apply_delta,
+            "trigger_sleep_consolidation": self._handle_trigger_sleep_consolidation,
             "sync_peer_status": self._handle_sync_peer_status,
         }
         self._last_memory_md_mtime: float = 0.0
@@ -145,6 +146,7 @@ class AtlasDaemon:
         self._server = await asyncio.start_unix_server(
             self._handle_client,
             path=str(self.socket_path),
+            limit=16 * 1024 * 1024,
         )
         self._serving = True
         logger.info("AtlasDaemon started on %s (pid: %d)", self.socket_path, os.getpid())
@@ -220,13 +222,16 @@ class AtlasDaemon:
         self._active_writers.add(writer)
         try:
             while self._serving:
-                # 4-byte big-endian length prefix
-                length_bytes = await reader.readexactly(4)
+                # 4-byte big-endian length prefix with timeout protection
+                try:
+                    length_bytes = await asyncio.wait_for(reader.readexactly(4), timeout=60.0)
+                except asyncio.TimeoutError:
+                    break
                 (msg_len,) = struct.unpack(">I", length_bytes)
                 if msg_len > 16 * 1024 * 1024:  # 16 MB protection limit
                     raise ValueError(f"Message length too large: {msg_len} bytes")
 
-                payload_bytes = await reader.readexactly(msg_len)
+                payload_bytes = await asyncio.wait_for(reader.readexactly(msg_len), timeout=30.0)
                 request_dict = json.loads(payload_bytes.decode("utf-8"))
 
                 response = await self._dispatch_rpc(request_dict)
@@ -243,7 +248,7 @@ class AtlasDaemon:
             self._active_writers.discard(writer)
             try:
                 writer.close()
-                await writer.wait_closed()
+                await asyncio.wait_for(writer.wait_closed(), timeout=5.0)
             except Exception as exc:
                 logger.debug("Error closing client connection writer: %s", exc)
 
@@ -511,7 +516,8 @@ class AtlasDaemon:
         lines = [ln.strip() for ln in combined_text.splitlines() if ln.strip()]
 
         for ln in lines:
-            if any(k in ln.lower() for k in ("preferuj", "język", "language", "klowstack", "peptyd", "obsidian", "mcp", "zasada", "wymagan", "bpc-157", "ghk-cu", "test-fact")):
+            # Strukturalna ekstrakcja zdań informacyjnych, preferencji i par klucz-wartość
+            if len(ln.split()) >= 3 and not ln.startswith(("#", "//", "```", "<")):
                 words = ln.split()
                 subj = " ".join(words[:4]) if words else "turn_fact"
                 if self.engine is not None and hasattr(self.engine, "kv") and self.engine.kv is not None:
@@ -601,14 +607,52 @@ class AtlasDaemon:
                 observed_predicate=observed_predicate,
                 observed_value=observed_value,
             )
-            logger.info("[RPC] active_sensing entity='%s' -> has_error=%s", target_entity, error is not None)
+
+            # Wektor V37: Anomaly-Driven Causal Graph Auto-Annealing
+            anneal_triggered = False
+            if error is not None and self.causal_engine is not None and hasattr(self.causal_engine, "recalibrate_graph_with_annealer"):
+                try:
+                    asyncio.create_task(
+                        self.causal_engine.recalibrate_graph_with_annealer(target_entity=target_entity)
+                    )
+                    anneal_triggered = True
+                except Exception as exc:
+                    logger.debug("Failed to spawn causal auto-annealing: %s", exc)
+
+            logger.info("[RPC] active_sensing entity='%s' -> has_error=%s (anneal_triggered=%s)", target_entity, error is not None, anneal_triggered)
             return {
                 "status": "ok",
                 "probe": target_entity,
                 "has_error": error is not None,
                 "prediction_error": error.model_dump() if error else None,
+                "anneal_triggered": anneal_triggered,
             }
         return {"probe": target_entity, "sensed": True}
+
+    async def _handle_trigger_sleep_consolidation(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        """Manually or autonomically triggers L3 sleep cycle consolidation and SOP skill compilation."""
+        skills_dir = params.get("skills_dir") or (Path.home() / ".hermes" / "skills" / "baked-skills")
+        if self.engine is not None and hasattr(self.engine, "auditor") and self.engine.auditor is not None:
+            stats = await self.engine.auditor.run_sleep_cycle_consolidation()
+
+            from atlas_memory.l3_procedural.sleep_baker import SleepBaker
+            baker = SleepBaker()
+            trajectories = []
+            if hasattr(self.engine, "trajectory_buffer") and self.engine.trajectory_buffer is not None:
+                trajectories = getattr(self.engine.trajectory_buffer, "trajectories", [])
+
+            baked_results = await baker.auto_consolidate_and_bake(
+                trajectories=trajectories,
+                kv_store=self.engine.kv,
+                skills_dir=skills_dir,
+            )
+            return {
+                "status": "ok",
+                "consolidated_records": stats.consolidated_records if hasattr(stats, "consolidated_records") else 0,
+                "baked_sops_count": len(baked_results),
+                "baked_sops": baked_results,
+            }
+        return {"status": "no_engine_auditor", "baked_sops_count": 0}
 
     async def _handle_telemetry_report(self, params: Dict[str, Any]) -> Dict[str, Any]:
         """Return server telemetry report."""

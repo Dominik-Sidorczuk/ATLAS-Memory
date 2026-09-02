@@ -39,28 +39,34 @@ def numba_jepa_step(
     w_val: np.ndarray,
 ) -> tuple[np.ndarray, float, float]:
     """
-    Predykcja przejścia stanu JEPA skompilowana w Numba JIT:
+    Predykcja przejścia stanu JEPA skompilowana w Numba JIT (Fused Linear Projection):
     next_s = tanh(s_t @ w_s + a_t @ w_a + bias)
     """
-    s_proj = _numba_matmul_2d(s_t, w_s)
-    a_proj = _numba_matmul_2d(a_t, w_a)
+    s_dim = s_t.shape[1]
+    a_dim = a_t.shape[1]
+    n_cols = w_s.shape[1]
 
-    n_cols = s_proj.shape[1]
-    next_s = np.zeros((1, n_cols), dtype=np.float64)
-    for j in range(n_cols):
-        raw = s_proj[0, j] + a_proj[0, j] + bias[0, j]
-        next_s[0, j] = np.tanh(raw)
-
-    # Ocena wartości i niepewności
-    reward_mat = _numba_matmul_2d(next_s, w_val)
-    sim_reward = float(reward_mat[0, 0])
-
+    next_s = np.empty((1, n_cols), dtype=np.float64)
     sq_sum = 0.0
-    for j in range(n_cols):
-        sq_sum += next_s[0, j] * next_s[0, j]
-    uncertainty = 1.0 - (sq_sum / n_cols)
 
-    return next_s, sim_reward, float(uncertainty)
+    for j in range(n_cols):
+        raw = bias[0, j]
+        for p in range(s_dim):
+            raw += s_t[0, p] * w_s[p, j]
+        for p in range(a_dim):
+            raw += a_t[0, p] * w_a[p, j]
+
+        val = np.tanh(raw)
+        next_s[0, j] = val
+        sq_sum += val * val
+
+    # Ocena wartości (next_s @ w_val)
+    sim_reward = 0.0
+    for p in range(n_cols):
+        sim_reward += next_s[0, p] * w_val[p, 0]
+
+    uncertainty = 1.0 - (sq_sum / n_cols) if n_cols > 0 else 1.0
+    return next_s, float(sim_reward), float(uncertainty)
 
 
 @njit(fastmath=True, nogil=True)

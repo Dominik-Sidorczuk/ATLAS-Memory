@@ -54,7 +54,7 @@ class OmniRouteShadowWorker:
         self.max_retries = max_retries
         self._custom_http_client = http_client_fn
 
-        self.turn_queue: asyncio.Queue[Dict[str, Any]] = asyncio.Queue()
+        self.turn_queue: asyncio.Queue[Dict[str, Any]] = asyncio.Queue(maxsize=1000)
         self._worker_task: Optional[asyncio.Task] = None
         self._is_running: bool = False
 
@@ -111,7 +111,8 @@ class OmniRouteShadowWorker:
                     self.turn_queue.task_done()
             except asyncio.CancelledError:
                 break
-            except Exception:
+            except Exception as exc:
+                logger.error("Shadow worker loop error: %s", exc, exc_info=True)
                 await asyncio.sleep(0.5)
 
     async def _process_single_turn(self, turn_data: Dict[str, Any]) -> None:

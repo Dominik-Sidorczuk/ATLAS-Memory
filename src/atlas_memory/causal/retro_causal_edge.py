@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import logging
 from typing import Any, Dict, List, Optional, Set
 
 import numpy as np
+
+logger = logging.getLogger("atlas.causal.retro_causal_edge")
 
 from atlas_memory.causal.models import (
     CausalEdge,
@@ -26,14 +29,31 @@ class RetroCausalEngine:
     4. Analiza dyfuzji przyczynowej i wykrywanie CPoF (Critical Points of Failure).
     """
 
-    CRITICAL_PREDICATES = {
+    DEFAULT_CRITICAL_PREDICATES = {
         "depends_on", "relies_on", "hosted_on", "hosts", "powers", "routes_to",
         "critical_for", "requires", "authenticates", "mounts", "databases",
+        "causes", "breaks", "blocks", "restricted_by", "requires_condition",
+    }
+    DEFAULT_CRITICAL_KEYWORDS = {
+        "crash", "failure", "fatal", "broken", "corrupt", "leak", "deadlock",
+        "hazard", "toxic", "toxicity", "diminishing_returns", "danger",
     }
 
-    def __init__(self, graph_client: Any, latent_buffer: Optional[Any] = None):
+    # Backward compatibility class-level references
+    CRITICAL_PREDICATES = DEFAULT_CRITICAL_PREDICATES
+    CRITICAL_KEYWORDS = DEFAULT_CRITICAL_KEYWORDS
+
+    def __init__(
+        self,
+        graph_client: Any,
+        latent_buffer: Optional[Any] = None,
+        critical_predicates: Optional[Set[str]] = None,
+        critical_keywords: Optional[Set[str]] = None,
+    ):
         self.graph = graph_client
         self.latent = latent_buffer
+        self.critical_predicates = set(critical_predicates) if critical_predicates is not None else set(self.DEFAULT_CRITICAL_PREDICATES)
+        self.critical_keywords = set(critical_keywords) if critical_keywords is not None else set(self.DEFAULT_CRITICAL_KEYWORDS)
 
     async def causal_diffusion_analysis(
         self,
@@ -96,7 +116,7 @@ class RetroCausalEngine:
                         predicate=pred,
                         target=tgt,
                         confidence=conf,
-                        impact_type="critical_dependency" if pred in self.CRITICAL_PREDICATES else "general_dependency",
+                        impact_type="critical_dependency" if pred in self.critical_predicates else "general_dependency",
                     ))
 
                 hop_depth = current_depth
@@ -352,17 +372,24 @@ class RetroCausalEngine:
                     predicate=pred,
                     target=tgt,
                     confidence=conf,
-                    impact_type="critical_dependency" if pred in self.CRITICAL_PREDICATES else "general_dependency",
+                    impact_type="critical_dependency" if pred in self.critical_predicates else "general_dependency",
                 )
 
                 new_steps = current_steps + [step]
                 new_conf = round(current_conf * conf, 4)
 
                 # Ocena poziomu ryzyka ścieżki
-                has_critical = any(s.predicate in self.CRITICAL_PREDICATES for s in new_steps)
-                if has_critical and new_conf >= 0.7:
-                    risk = "CRITICAL" if len(new_steps) == 1 else "HIGH"
-                elif has_critical or new_conf >= 0.5:
+                has_critical_pred = any(s.predicate in self.critical_predicates for s in new_steps)
+                has_critical_keyword = any(
+                    any(k in s.target.lower() or k in s.predicate.lower() or k in s.source.lower() for k in self.critical_keywords)
+                    for s in new_steps
+                )
+                is_target_hazardous = any(k in tgt.lower() for k in self.critical_keywords)
+                if is_target_hazardous or ((has_critical_pred or has_critical_keyword) and new_conf >= 0.7):
+                    risk = "CRITICAL"
+                elif (has_critical_pred or has_critical_keyword) and new_conf >= 0.4:
+                    risk = "HIGH"
+                elif new_conf >= 0.7:
                     risk = "MODERATE"
                 else:
                     risk = "LOW"
@@ -430,4 +457,97 @@ class RetroCausalEngine:
             return await self.graph.get_subgraph_relations([entity], max_depth=max_depth)
         elif hasattr(self.graph, "get_subgraph_for_entities"):
             return await self.graph.get_subgraph_for_entities([entity])
+        elif hasattr(self.graph, "nx_graph"):
+            edges = []
+            for u, v, data in self.graph.nx_graph.edges(data=True):
+                edges.append({
+                    "subject": u,
+                    "predicate": data.get("predicate", "relates_to"),
+                    "object": v,
+                    "confidence": data.get("confidence", 1.0),
+                })
+            return {"relations": edges, "active_roots": [entity]}
+        elif isinstance(self.graph, dict) or hasattr(self.graph, "adj"):
+            edges = []
+            adj = self.graph if isinstance(self.graph, dict) else getattr(self.graph, "adj", {})
+            for u, nbrs in adj.items():
+                for nbr in nbrs:
+                    if isinstance(nbr, dict):
+                        edges.append({
+                            "subject": u,
+                            "predicate": nbr.get("predicate", "leads_to"),
+                            "object": nbr.get("target", ""),
+                            "confidence": nbr.get("confidence", 1.0),
+                        })
+                    elif isinstance(nbr, str):
+                        edges.append({"subject": u, "predicate": "leads_to", "object": nbr, "confidence": 1.0})
+            return {"relations": edges, "active_roots": [entity]}
         return {"relations": []}
+
+    async def recalibrate_graph_with_annealer(
+        self,
+        energy_module: Optional[Any] = None,
+        annealer: Optional[Any] = None,
+        target_entity: Optional[str] = None,
+        max_depth: int = 2,
+    ) -> Dict[str, Any]:
+        """
+        Wektor V37: Autonomiczna rekalibracja wag grafu przyczynowego Kùzu przez wyżarzanie.
+        
+        Pobiera podgraf wokół target_entity, tworzy obiekty CausalEdge, optymalizuje ich wagi
+        za pomocą CausalAnnealer i aktualizuje zoptymalizowane pewności z powrotem w grafie.
+        """
+        if self.graph is None:
+            return {"status": "no_graph", "updated_edges": 0}
+
+        subgraph_data = await self._fetch_subgraph(target_entity or "Root", max_depth=max_depth)
+        relations = subgraph_data.get("relations", [])
+        if not relations:
+            return {"status": "no_relations", "updated_edges": 0}
+
+        edges = [
+            CausalEdge(
+                source=r["subject"],
+                predicate=r["predicate"],
+                target=r["object"],
+                confidence=float(r.get("confidence", 1.0)),
+                impact_type="critical_dependency" if r.get("predicate") in self.critical_predicates else "general_dependency",
+            )
+            for r in relations
+            if r.get("subject") and r.get("object") and r.get("predicate")
+        ]
+
+        if not edges:
+            return {"status": "empty_edges", "updated_edges": 0}
+
+        if energy_module is None:
+            from atlas_memory.causal.energy_module import EnergyModule
+            energy_module = EnergyModule(graph_client=self.graph)
+
+        if annealer is None:
+            from atlas_memory.causal.annealer import CausalAnnealer
+            annealer = CausalAnnealer(energy_module=energy_module)
+
+        anneal_res = await annealer.run(edges)
+
+        updated_count = 0
+        for opt_edge in anneal_res.final_edges:
+            if hasattr(self.graph, "add_relation"):
+                try:
+                    self.graph.add_relation(
+                        opt_edge.source,
+                        opt_edge.predicate,
+                        opt_edge.target,
+                        confidence=opt_edge.confidence,
+                    )
+                    updated_count += 1
+                except Exception as exc:
+                    logger.debug("Error committing annealed edge: %s", exc)
+
+        return {
+            "status": "ok",
+            "iterations": anneal_res.iterations,
+            "converged": anneal_res.converged,
+            "duration_ms": anneal_res.duration_ms,
+            "updated_edges": updated_count,
+        }

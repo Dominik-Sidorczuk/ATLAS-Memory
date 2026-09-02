@@ -11,9 +11,10 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import sqlite3
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from atlas_memory.models import EpistemicSource, MemoryRecord
 
@@ -145,21 +146,29 @@ class MnemosyneIngestEngine:
                     "SELECT id, content, importance, session_id, created_at, event_date FROM working_memory"
                 )
                 for row in cur.fetchall():
-                    content = row["content"] or ""
+                    content = (row["content"] or "").strip()
                     importance = float(row["importance"] or 0.7)
                     session_id = row["session_id"] or "hermes_default"
                     created_at = row["created_at"] or ""
-                    
-                    words = content.split()
-                    subject = " ".join(words[:4]) if words else "working_memory"
-                    
+
+                    # Filter out raw conversational chatter, prompt headers, and low-importance dialogue turns
+                    if not content or content.startswith(("[USER]", "[ASSISTANT]", "System:", "##", "User:")) or importance < 0.8:
+                        continue
+
+                    # Extract concise semantic subject
+                    if ":" in content and len(content.split(":", 1)[0].split()) <= 4:
+                        subject = content.split(":", 1)[0].strip()
+                    else:
+                        words = [w for w in content.split() if not w.startswith(("[", "<", "@"))]
+                        subject = " ".join(words[:3]) if words else "working_fact"
+
                     records.append(
                         MemoryRecord(
                             subject=subject[:80],
                             predicate="working_fact",
                             object=content,
                             importance_score=min(1.0, max(0.1, importance)),
-                            source_type=EpistemicSource.USER_EXPLICIT if importance > 0.8 else EpistemicSource.TOOL_OUTPUT,
+                            source_type=EpistemicSource.USER_EXPLICIT if importance > 0.85 else EpistemicSource.TOOL_OUTPUT,
                             source_session_id=session_id,
                             metadata={
                                 "origin": "mnemosyne_working_memory",
@@ -257,7 +266,11 @@ class MnemosyneIngestEngine:
         logger.info("Extracted %d total records from Mnemosyne & MEMORY.md", len(records))
         return records
 
-    def sync_into_atlas_engine(self, engine: Any) -> Dict[str, Any]:
+    def sync_into_atlas_engine(
+        self,
+        engine: Any,
+        seed_triples: Optional[List[Tuple[str, str, str, float]]] = None,
+    ) -> Dict[str, Any]:
         """Ingests all extracted records directly into the Atlas HybridMemoryEngine."""
         records = self.extract_records()
         if not records:
@@ -269,49 +282,43 @@ class MnemosyneIngestEngine:
 
         for rec in records:
             try:
-                # 1. Write to KV Store (Source of Truth ledger)
+                # 1. Write to KV Store with canonical deduplicated keys
                 if hasattr(engine, "kv") and engine.kv is not None:
-                    var_key = f"mnemosyne:{rec.metadata.get('origin', 'raw')}:{rec.subject}:{rec.predicate}"
+                    clean_sub = re.sub(r'[^a-zA-Z0-9_:]', '_', rec.subject.strip().lower()).strip('_')
+                    clean_pred = re.sub(r'[^a-zA-Z0-9_:]', '_', rec.predicate.strip().lower()).strip('_')
+                    var_key = f"fact:{clean_sub}:{clean_pred}"[:60]
                     engine.kv.set_sync(var_key, rec.object, metadata=rec.metadata)
                     kv_count += 1
 
-                # 2. Write to Kùzu Knowledge Graph if present
+                # 2. Write to Kùzu Knowledge Graph (Clean domain entities only)
                 if hasattr(engine, "graph") and engine.graph is not None:
-                    try:
-                        engine.graph.add_entity(rec.subject, entity_type="Concept")
-                        engine.graph.add_entity(rec.object[:80], entity_type="Observation")
-                        engine.graph.add_relation(rec.subject, rec.predicate, rec.object[:80])
-                        graph_count += 1
-                    except Exception as g_exc:
-                        logger.debug("Graph insert error for %s: %s", rec.subject, g_exc)
+                    # Skip noise or raw prompt turns from graph entities
+                    if not rec.subject.startswith(("[", "<", "working_fact", "episodic_event")) and len(rec.subject.strip()) >= 3:
+                        clean_subj = re.sub(r'[^a-zA-Z0-9_:]', '_', rec.subject.strip())[:60].strip('_')
+                        clean_obj = re.sub(r'[^a-zA-Z0-9_:]', '_', str(rec.object).strip())[:60].strip('_')
+                        clean_pred = re.sub(r'[^a-zA-Z0-9_:]', '_', rec.predicate.strip())[:40].strip('_')
+
+                        if clean_subj and clean_obj and clean_pred:
+                            try:
+                                engine.graph.add_entity(clean_subj, entity_type="Concept")
+                                engine.graph.add_entity(clean_obj, entity_type="Observation")
+                                engine.graph.add_relation(clean_subj, clean_pred, clean_obj, confidence=float(rec.confidence))
+                                graph_count += 1
+                            except Exception as g_exc:
+                                logger.debug("Graph insert error for %s: %s", clean_subj, g_exc)
 
                 ingested_count += 1
             except Exception as exc:
                 logger.debug("Failed to ingest record %s: %s", rec.subject, exc)
 
-        # Seed core architectural and domain causal dependencies
-        if hasattr(engine, "graph") and engine.graph is not None:
-            domain_triples = [
-                ("pixi_environment", "hosts", "python314_nogil", 1.0),
-                ("python314_nogil", "powers", "atlas_daemon_kuzu_qdrant", 1.0),
-                ("python314_nogil", "critical_for", "no_gil_multithreading", 1.0),
-                ("remove_python314_nogil", "breaks", "atlas_c_rust_libraries", 1.0),
-                ("GHK-Cu", "influences", "collagen_synthesis", 1.0),
-                ("GHK-Cu", "restricted_by", "max_dose_le_2_to_3mg", 1.0),
-                ("dose_gt_3mg", "causes", "copper_toxicity_and_diminishing_returns", 1.0),
-                ("KlowStack", "contains", "GHK-Cu", 1.0),
-                ("KlowStack", "requires", "colonoscopy_cea_fit_oncology_screening", 1.0),
-                ("omitting_screening", "critical_for", "tumor_stimulation_via_angiogenesis", 1.0),
-                ("KlowStack", "requires_condition", "storage_at_4C", 1.0),
-                ("Crawl4AI", "runs_on", "localhost_11235", 1.0),
-                ("Obsidian_MCP", "runs_on", "localhost_27124", 1.0),
-            ]
-            for s, p, o, conf in domain_triples:
+        # Seed optional user-provided causal dependencies if provided
+        if hasattr(engine, "graph") and engine.graph is not None and seed_triples:
+            for s, p, o, conf in seed_triples:
                 try:
                     engine.graph.add_relation(s, p, o, confidence=conf)
                     graph_count += 1
-                except Exception:
-                    pass
+                except Exception as dt_exc:
+                    logger.debug("Seed triple insert error: %s", dt_exc)
 
         return {
             "status": "ok",

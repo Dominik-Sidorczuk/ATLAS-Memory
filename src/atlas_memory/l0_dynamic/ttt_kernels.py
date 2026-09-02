@@ -63,6 +63,8 @@ def numba_ttt_adapt_step(
     n_rows = diff.shape[0]
     n_cols = diff.shape[1]
     total_elements = n_rows * n_cols
+    if total_elements == 0:
+        return 0.0
 
     loss = 0.0
     for i in range(n_rows):

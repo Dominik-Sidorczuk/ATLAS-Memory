@@ -34,6 +34,38 @@ def _fast_parallel_asymmetric_scan(
     return scores
 
 
+@numba.njit(fastmath=True, parallel=True, nogil=True)
+def _fast_lut_nibble_scan_kernel(
+    lut: np.ndarray,
+    packed: np.ndarray,
+    scales: np.ndarray,
+    dim: int,
+) -> np.ndarray:
+    """Równoległe jądro JIT obliczające odległości bezpośrednio z tablicy LUT bez dekompresji."""
+    n = packed.shape[0]
+    n_bytes = packed.shape[1]
+    scores = np.empty(n, dtype=np.float32)
+
+    for i in numba.prange(n):
+        dot = 0.0
+        for b in range(n_bytes):
+            byte_val = packed[i, b]
+            high_nibble = (byte_val >> 4) & 0x0F
+            low_nibble = byte_val & 0x0F
+
+            d_high = b * 2
+            if d_high < dim:
+                dot += lut[d_high, high_nibble]
+
+            d_low = b * 2 + 1
+            if d_low < dim:
+                dot += lut[d_low, low_nibble]
+
+        scores[i] = dot * scales[i]
+
+    return scores
+
+
 
 class RaBitQResult(BaseModel):
     """
@@ -148,7 +180,7 @@ class RaBitQEngine:
         Returns:
             RaBitQResult zawierający upakowane dane i metadane rotacji.
         """
-        arr = np.asarray(vectors, dtype=np.float32)
+        arr = np.nan_to_num(np.asarray(vectors, dtype=np.float32), nan=0.0, posinf=0.0, neginf=0.0)
         is_1d = arr.ndim == 1
         if is_1d:
             arr = arr.reshape(1, -1)
@@ -191,7 +223,7 @@ class RaBitQEngine:
             
             even_nibbles = quant_ints[:, 0::2]
             odd_nibbles = quant_ints[:, 1::2]
-            packed_data = (even_nibbles << 4) | (odd_nibbles & 0x0F)
+            packed_data = ((even_nibbles << 4) | (odd_nibbles & 0x0F)).astype(np.uint8)
         else:
             # Ogólny przypadek bits in {2, 3, 5, 6, 7}
             clipped = np.clip(normalized, min_val, max_val)
@@ -377,4 +409,44 @@ class RaBitQEngine:
         
         k = min(top_k, n_vectors)
         return np.argsort(-scores)[:k]
+
+    def fast_lut_asymmetric_scan(
+        self,
+        query: np.ndarray,
+        quantized: RaBitQResult,
+        top_k: int = 10,
+    ) -> np.ndarray:
+        """
+        Wektor V37: Przyspieszone skanowanie asymetryczne oparte na tablicach Look-Up (LUT).
+        
+        Wstępnie oblicza iloczyny skalarne dla 16 poziomów kwantyzacji dla każdego wymiaru,
+        omijając dekompresję wektorów i operując bezpośrednio na strefach pamięci bajtowej.
+        """
+        if quantized.n_vectors == 0:
+            return np.empty(0, dtype=np.int64)
+
+        q = np.asarray(query, dtype=np.float32).reshape(-1)
+        q_norm = np.linalg.norm(q)
+        if q_norm > 0:
+            q = q / q_norm
+
+        q_rot = (q @ quantized.rotation_matrix.T).astype(np.float32)
+        dim = quantized.original_dim
+        n_vectors = quantized.n_vectors
+
+        if quantized.bits == 4:
+            sigma = 1.0 / np.sqrt(float(dim))
+            min_val = -3.0 * sigma
+            max_val = 3.0 * sigma
+            levels = (np.arange(16, dtype=np.float32) / 15.0) * (max_val - min_val) + min_val
+            lut = np.outer(q_rot[:dim], levels).astype(np.float32)
+
+            packed = quantized.quantized_data
+            scales = quantized.scale.reshape(-1).astype(np.float32)
+            scores = _fast_lut_nibble_scan_kernel(lut, packed, scales, dim)
+
+            k = min(top_k, n_vectors)
+            return np.argsort(-scores)[:k]
+        else:
+            return self.fast_asymmetric_scan(query, quantized, top_k=top_k)
 
