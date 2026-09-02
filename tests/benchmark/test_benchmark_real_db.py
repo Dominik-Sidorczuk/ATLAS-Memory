@@ -134,8 +134,8 @@ def real_atlas_provider(snapshot_db: Path) -> AtlasMemoryProvider:
 class TestRealDatabaseBEAMBenchmark:
     """Empirical Evaluation on live SQLite Snapshot following BEAM & LongMemEval protocols."""
 
-    @pytest.fixture(autouse=True)
-    def check_real_db(self, snapshot_db: Path) -> None:
+    def test_safe_snapshot_and_wal_consolidation(self, snapshot_db: Path) -> None:
+        """Verify snapshot database exists with consolidated WAL and rich record counts."""
         real_db = Path.home() / ".hermes/mnemosyne/data/mnemosyne.db"
         if not real_db.exists() or not snapshot_db.exists():
             pytest.skip("real DB not present — CI smoke")
@@ -149,20 +149,6 @@ class TestRealDatabaseBEAMBenchmark:
             conn.close()
             pytest.skip("snapshot DB has no annotations table — not a real Mnemosyne DB")
 
-        ann_count = c.execute("SELECT count(*) FROM annotations").fetchone()[0]
-        conn.close()
-
-        if ann_count == 0:
-            pytest.skip("snapshot DB has 0 annotations — not a real Mnemosyne snapshot (CI)")
-
-    def test_safe_snapshot_and_wal_consolidation(self, snapshot_db: Path) -> None:
-        """Verify snapshot database exists with consolidated WAL and rich record counts."""
-        # Note: The skip logic is now handled by the check_real_db fixture.
-        conn = sqlite3.connect(str(snapshot_db))
-        c = conn.cursor()
-        c.execute("SELECT name FROM sqlite_master WHERE type='table'")
-        tables = {r[0] for r in c.fetchall()}
-
         assert "working_memory" in tables
         assert "gists" in tables
         assert "memoria_facts" in tables
@@ -171,6 +157,9 @@ class TestRealDatabaseBEAMBenchmark:
         wm_count = c.execute("SELECT count(*) FROM working_memory").fetchone()[0]
         gist_count = c.execute("SELECT count(*) FROM gists").fetchone()[0]
         conn.close()
+
+        if ann_count == 0:
+            pytest.skip("snapshot DB has 0 annotations — not a real Mnemosyne snapshot (CI)")
 
         assert ann_count >= 1000, f"Expected >=1000 annotations in real DB, got {ann_count}"
         assert wm_count >= 300, f"Expected >=300 working memory records, got {wm_count}"
