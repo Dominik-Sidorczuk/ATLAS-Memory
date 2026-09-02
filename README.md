@@ -53,12 +53,12 @@ Modern AI agents built on top of state-of-the-art LLM APIs (DeepSeek, Claude 3.7
 
 | Architectural Lever | Technical Metric | Operational Impact |
 |---|:---:|---|
-| 🚪 **Retrieval Policy Gate** | **$5.97\ \mu\text{s}$ P50** | **95% noise reduction**; screens out chit-chat queries with **0 injected recall tokens**. |
-| 🎒 **Epistemic Knapsack Packing** | **$\le 1500$ tok ceiling** | **91.4% prompt token savings**; dynamic $0/1$ Knapsack DP maximizes information density. |
+| 🚪 **Retrieval Policy Gate** | **5.97 μs P50** | **95% noise reduction**; screens out chit-chat queries with **0 injected recall tokens**. |
+| 🎒 **Epistemic Knapsack Packing** | **≤1500 tok ceiling** | **91.4% prompt token savings**; dynamic 0/1 Knapsack DP maximizes information density. |
 | 🗜️ **RaBitQ & MIB 32× Quantization** | **32.0× RAM compression** | **1.47M vectors/sec** on CPU via AVX-512 SIMD popcount; runs million-vector scans in microseconds. |
 | 🔗 **Causal Topological Graph** | **Sub-1 ms DFS BFS** | Detects Critical Points of Failure (**CPoF**) and simulates perturbation waves before destructive actions. |
-| 🔒 **Cryptographic State Ledger** | **8,550+ SHA-256 blocks** | Tamper-evident Merkle hash-chain ($prev\_hash \to entry\_hash$) guarantees immutable history. |
-| 🛡️ **Byzantine Fault Tolerant Mesh** | **$2f+1$ Quorum** | Multi-agent gossip protocol with AES-256-GCM encryption and dynamic epistemic peer reputation. |
+| 🔒 **Cryptographic State Ledger** | **8,550+ SHA-256 blocks** | Tamper-evident Merkle hash-chain (prev_hash → entry_hash) guarantees immutable history. |
+| 🛡️ **Byzantine Fault Tolerant Mesh** | **2f+1 Quorum** | Multi-agent gossip protocol with AES-256-GCM encryption and dynamic epistemic peer reputation. |
 | 💤 **Procedural Sleep Consolidation** | **0 LLM token cost** | Compiles verified multi-turn trajectories into native executable `SKILL.md` tools guarded by an AST scanner. |
 
 ---
@@ -69,11 +69,11 @@ To understand how ATLAS operates in production, consider the 6 core cognitive en
 
 ### 1. 🚪 The Smart Doorkeeper (*Retrieval Policy Gate*)
 * **The Analogy:** A smart executive assistant who doesn't pull 20 heavy archive binders out of the filing cabinet when you just say *"Good morning!"*.
-* **How It Works:** An ultra-lightweight $O(1)$ canonicalizer scans incoming messages for named entities, system intents, or stored alias keys in $<6\ \mu\text{s}$. If the user's turn is casual conversational banter, the gate stays **CLOSED**—passing the prompt directly to the LLM with **0 wasted memory tokens**. If an entity or memory trigger is detected, the gate snaps **OPEN**.
+* **How It Works:** An ultra-lightweight O(1) canonicalizer scans incoming messages for named entities, system intents, or stored alias keys in <6 μs. If the user's turn is casual conversational banter, the gate stays **CLOSED**—passing the prompt directly to the LLM with **0 wasted memory tokens**. If an entity or memory trigger is detected, the gate snaps **OPEN**.
 
 ### 2. 🎒 The Precision Luggage Scale (*Epistemic Knapsack Packing*)
 * **The Analogy:** Packing a carry-on suitcase for a flight where every gram counts. You pack your passport and laptop first, and leave the bulky low-value junk at home.
-* **How It Works:** Memory facts are scored on two axes: **Veracity Score** ($\text{USER\_EXPLICIT} = 1.0 > \text{TOOL\_OBSERVED} = 0.85 > \text{AGENT\_INFERENCE} = 0.50$) and **Token Cost**. ATLAS runs a dynamic programming $0/1$ Knapsack algorithm to maximize total information density ($I = \text{score} / \text{tokens}$), guaranteeing that the injected context strictly respects the $\le 1500$ token budget ceiling.
+* **How It Works:** Memory facts are scored on two axes: **Veracity Score** (USER_EXPLICIT (1.0) > TOOL_OBSERVED (0.85) > AGENT_INFERENCE (0.50)) and **Token Cost**. ATLAS runs a dynamic programming 0/1 Knapsack algorithm to maximize total information density (I = score/tokens), guaranteeing that the injected context strictly respects the ≤1500 token budget ceiling.
 
 ### 3. 🗜️ The Embedding Zipper (*32× RaBitQ / MIB Quantization*)
 * **The Analogy:** Compressing high-resolution RAW photos into lightweight vector glyphs that can be searched in parallel across millions of images without a GPU.
@@ -81,15 +81,15 @@ To understand how ATLAS operates in production, consider the 6 core cognitive en
 
 ### 4. 🔗 The Blast-Radius Simulator (*Causal Graph & CPoF What-If*)
 * **The Analogy:** Running a flight simulator before piloting a real airplane. Before switching off a server or altering a database schema, the system simulates what downstream systems will crash.
-* **How It Works:** ATLAS maintains a topological property graph in Kùzu DB. When the agent contemplates a destructive action, `atlas_what_if` traverses multi-hop dependency edges (e.g., `Obsidian_MCP:27124` $\to$ `Reporting_Pipeline` $\to$ `Daily_Master_Report`). If a path contains a Critical Point of Failure (**CPoF**), it raises an immediate `CRITICAL` risk alarm and hard-blocks execution until authorized by a human gate.
+* **How It Works:** ATLAS maintains a topological property graph in Kùzu DB. When the agent contemplates a destructive action, `atlas_what_if` traverses multi-hop dependency edges (e.g., `Obsidian_MCP:27124` → `Reporting_Pipeline` → `Daily_Master_Report`). If a path contains a Critical Point of Failure (**CPoF**), it raises an immediate `CRITICAL` risk alarm and hard-blocks execution until authorized by a human gate.
 
 ### 5. 🔒 The Immutable Black Box (*SHA-256 Merkle Ledger*)
 * **The Analogy:** A flight data recorder with a tamper-evident cryptographic seal. No agent can rewrite history or "forget" a previous instruction to cover up an error.
-* **How It Works:** Every write to `state_variables` appends a block to `state_audit_log` where $H_i = \text{SHA-256}(H_{i-1} \parallel key \parallel value \parallel timestamp \parallel reason)$. Any retroactive modification of past records invalidates the mathematical hash chain across all subsequent blocks.
+* **How It Works:** Every write to `state_variables` appends a block to `state_audit_log` where H_i = SHA-256(H_{i-1} || key || value || timestamp || reason). Any retroactive modification of past records invalidates the mathematical hash chain across all subsequent blocks.
 
 ### 6. 💤 The Nightly Consolidator (*Sleep Baker & Autonomous Skill Compiler*)
 * **The Analogy:** How the human brain consolidates short-term motor memories into permanent reflexes during deep REM sleep.
-* **How It Works:** During idle cycles, the `SleepBaker` analyzes repeated execution traces (e.g., successful multi-step git release workflows). High-success sequences ($>0.85$ success rate) are compiled into standalone, native Hermes skills (`SKILL.md` + `handler.py`). Every generated Python handler passes through an **AST Safety Scanner** to eliminate RCE vulnerabilities (`eval`, `exec`, `os.system`, `subprocess`) before being registered into the agent's toolset.
+* **How It Works:** During idle cycles, the `SleepBaker` analyzes repeated execution traces (e.g., successful multi-step git release workflows). High-success sequences (>0.85 success rate) are compiled into standalone, native Hermes skills (`SKILL.md` + `handler.py`). Every generated Python handler passes through an **AST Safety Scanner** to eliminate RCE vulnerabilities (`eval`, `exec`, `os.system`, `subprocess`) before being registered into the agent's toolset.
 
 <p align="center">
   <img src="docs/assets/atlas_architecture_diagram.svg" alt="ATLAS Architecture Blueprint" width="100%"/>
@@ -156,11 +156,11 @@ flowchart TD
 
 | Lever | Module | Architectural Role & Measured Impact |
 |:---|:---|:---|
-| 🧠 **Retrieval Policy Gate** | `orchestrator.py` | **$5.97\ \mu\text{s}$ P50** decision latency. Prevents memory retrieval on non-factual turns, achieving **95% noise reduction**. |
-| 📦 **Epistemic Knapsack Packing** | `orchestrator.py` | Strict **$\le 1500$ token budget** enforcement. Delivers **91.4% prompt token savings** using density-weighted knapsack optimization. |
+| 🧠 **Retrieval Policy Gate** | `orchestrator.py` | **5.97 μs P50** decision latency. Prevents memory retrieval on non-factual turns, achieving **95% noise reduction**. |
+| 📦 **Epistemic Knapsack Packing** | `orchestrator.py` | Strict **≤1500 token budget** enforcement. Delivers **91.4% prompt token savings** using density-weighted knapsack optimization. |
 | 🗜️ **RaBitQ / MIB 32× Quantization** | `rabitq_engine.py` | **32.0× RAM compression** (SIGMOD'25). High-throughput CPU vector scan achieving **1.47M vectors/sec** via AVX-512. |
 | 🔗 **Causal Dependency Graph** | `retro_causal_edge.py` | Structural Causal Models (SCM) with multi-hop what-if simulation, perturbation diffusion, and Critical Points of Failure (**CPoF**) detection. |
-| 🔒 **Byzantine Fault Tolerant Sync** | `bft_crdt.py` | Multi-agent Delta-CRDT with AES-256-GCM encryption, **$2f+1$ signature quorum**, and dynamic epistemic peer reputation scoring. |
+| 🔒 **Byzantine Fault Tolerant Sync** | `bft_crdt.py` | Multi-agent Delta-CRDT with AES-256-GCM encryption, **2f+1 signature quorum**, and dynamic epistemic peer reputation scoring. |
 | 🛠️ **Autonomous Skill Compiler** | `skill_compiler.py` | Distills repeated successful execution traces into native `SKILL.md` bundles, verified against RCE by an **AST Safety Scanner**. |
 | 💤 **Procedural Sleep Baker** | `sleep_baker.py` | Asynchronously consolidates ephemeral working memories into structured Standard Operating Procedures (SOP) during idle cycles. |
 
@@ -187,13 +187,13 @@ ATLAS is evaluated across two distinct, complementary dimensions: **algorithmic 
 | 02 | **`HybridMemoryEngine` Bootstrap** | **6.69 ms** | < 100 ms | Mem0 / Letta bootstrap: 150–400 ms | 🚀 **25×–60× faster bootstrapping** |
 | 03 | **`MemoryOrchestrator` Init** | **0.143 ms** *(143 μs)* | < 50 ms | Standard Agent Orchestrator: 10–30 ms | 🚀 **70× faster initialization** |
 | 04 | **Epistemic Re-Ranking (100 recs)** | **0.118 ms** *(118 μs)* | < 50 ms | Pure Mnemosyne: 0 veracity ranking (raw SQL scan) | 🛡️ **Veracity hierarchy** (`USER` > `TOOL` > `AGENT`) |
-| 05 | **Knapsack Token Packing (50 recs)**| **0.621 ms** *(621 μs)* | < 100 ms | Pure Mnemosyne: unbudgeted prompt dump (>15k tok) | 📦 **Strict $\le 1500$ tok** budget with 0/1 density opt |
+| 05 | **Knapsack Token Packing (50 recs)**| **0.621 ms** *(621 μs)* | < 100 ms | Pure Mnemosyne: unbudgeted prompt dump (>15k tok) | 📦 **Strict ≤1500 tok** budget with 0/1 density opt |
 | 06 | **Shadow Reconciliation (10 conf)** | **0.429 ms** *(429 μs)* | < 100 ms | Centralized lock-based DB sync: 15–50 ms | 🚀 **35× faster lock-free resolution** |
 | 07 | **Causal What-If Simulation** | **0.060 ms** *(60 μs)* | < 200 ms | Pure Mnemosyne: No causal engine (0 what-if) | 🔗 **Multi-hop counterfactual BFS in 60 μs** |
 | 08 | **Causal Diffusion Wave (30 nodes)**| **0.049 ms** *(49 μs)* | < 300 ms | NetworkX / Matrix Inversion: 3.5–8.0 ms | 🚀 **70× faster perturbation analysis** |
 | 09 | **UDS IPC Ping (50 calls avg)** | **0.028 ms** *(28 μs)* | < 1.0 ms | Localhost HTTP REST (FastAPI): 1.5–3.5 ms | 🚀 **50×–100× lower IPC latency** |
 | 10 | **SHA-256 Hash-Chain (100 blocks)** | **0.700 ms** *(700 μs)* | < 200 ms | Pure Mnemosyne: Standard SQLite (0 crypto audit) | 🔒 **Cryptographic tamper-evident ledger** |
-| 11 | **Sleep Baking (20 trajs $\to$ SOP)**| **0.065 ms** *(65 μs)* | < 500 ms | LLM consolidation: 2,000–5,000 ms + token cost | 💤 **Deterministic distillation at 0 tokens** |
+| 11 | **Sleep Baking (20 trajs → SOP)**| **0.065 ms** *(65 μs)* | < 500 ms | LLM consolidation: 2,000–5,000 ms + token cost | 💤 **Deterministic distillation at 0 tokens** |
 | 12 | **CPoF Bottleneck Detection (50n)** | **0.031 ms** *(31 μs)* | < 200 ms | Pure Mnemosyne: No topological failure analysis | 🔗 **Critical Points of Failure identified in 31 μs** |
 | 13 | **CRDT Delta Sync + AES-256-GCM** | **0.069 ms** *(69 μs)* | < 10 ms | Centralized database lock sync: 25–100 ms | 🚀 **300× faster VectorClock merge + crypto** |
 | 14 | **AVX-512 SIMD Quantization Scan** | **0.018 ms** *(18 μs)* | < 10 ms | NumPy float32 Cosine: 4.5–12.0 ms (1k vecs) | 🗜️ **250× faster SIMD scan** (1.47M vecs/sec) |
@@ -236,7 +236,7 @@ Empirical evaluation executed directly on a live, WAL-consolidated snapshot of p
 | **RAM Footprint per 10k Embeddings** | 15.36 MB | **0.48 MB** | 🗜️ **32× RAM compression via MIB** |
 
 #### Why These Numbers Matter in Production
-1. **Eliminating Prompt Pollution:** Pure Mnemosyne queries the database and injects memory dumps on *every single turn* (even "hello", "thank you", or unrelated syntax questions), causing 60/60 false noise injections and massive token bloat (1.22 Million tokens). ATLAS screens incoming queries in $<7\ \mu\text{s}$ using local heuristic and entity analysis—passing conversational queries through with **0 injected recall tokens** (91.7% abstention precision).
+1. **Eliminating Prompt Pollution:** Pure Mnemosyne queries the database and injects memory dumps on *every single turn* (even "hello", "thank you", or unrelated syntax questions), causing 60/60 false noise injections and massive token bloat (1.22 Million tokens). ATLAS screens incoming queries in <7 μs using local heuristic and entity analysis—passing conversational queries through with **0 injected recall tokens** (91.7% abstention precision).
 2. **Context Budget Protection:** When domain entities are detected, ATLAS packs only the highest-veracity, most relevant facts up to the 1500-token budget ceiling, reducing injected tokens from 1.22M to 57.4k (−95.3% savings) without losing vital information.
 3. **Hardware Acceleration:** When vector recall is needed, MIB 32× binarization enables CPU-side popcount scans over AVX-512 registers in microseconds, avoiding GPU reliance and reducing memory consumption by 32×.
 
@@ -248,7 +248,7 @@ ATLAS is designed with a **Two-Runtime Isolated Architecture**:
 1. **Host Agent Runtime:** Runs inside standard [Hermes Agent](https://github.com/nousresearch/hermes-agent) (`~/.hermes/venv/`, Python 3.11+).
 2. **Cognitive Daemon Runtime:** Runs inside an isolated, high-performance [Pixi](https://pixi.sh) environment (Python 3.14 Free-Threaded No-GIL) containing JIT Numba fastmath kernels, Kùzu graph DB, and SIMD quantizers.
 
-Communication between the two environments occurs over an ultra-low latency Unix Domain Socket (`~/.hermes/atlas.sock`) in $<15\ \mu\text{s}$.
+Communication between the two environments occurs over an ultra-low latency Unix Domain Socket (`~/.hermes/atlas.sock`) in <15 μs.
 
 ---
 
@@ -366,12 +366,12 @@ sequenceDiagram
 ### 2. Typing-Time Background Prefetch (`queue_prefetch`)
 * While the human user is typing or streaming their turn, Hermes triggers `queue_prefetch(query)`.
 * ATLAS executes the Kùzu graph BFS and RaBitQ vector scan asynchronously in the background.
-* When Hermes executes the synchronous `prefetch()` hook, the result is already resolved in memory—achieving **$<0.01\text{ ms}$ turn latency**.
+* When Hermes executes the synchronous `prefetch()` hook, the result is already resolved in memory—achieving **<0.01 ms turn latency**.
 
 ### 3. Veracity Hierarchy & Dynamic 0/1 Knapsack Packing
 * Rather than dumping raw database rows, `AtlasMemoryProvider` parses incoming Mnemosyne triples and assigns strict veracity weights:
-  $$\text{Veracity:}\quad \text{USER\_EXPLICIT } (1.0) > \text{TOOL\_OBSERVED } (0.85) > \text{AGENT\_INFERENCE } (0.50)$$
-* The $0/1$ Knapsack algorithm packs facts to maximize total veracity under the strict $\le 1500$ token budget.
+  **Veracity:** USER_EXPLICIT (1.0) > TOOL_OBSERVED (0.85) > AGENT_INFERENCE (0.50)
+* The 0/1 Knapsack algorithm packs facts to maximize total veracity under the strict ≤1500 token budget.
 
 ---
 
@@ -382,7 +382,7 @@ ATLAS exposes 5 first-class JSON-RPC 2.0 tools directly to LLM agents over `~/.h
 
 | Tool | Parameters | Architectural Function & Response Shape |
 |---|---|---|
-| **`atlas_recall`** | `query: str`, `session_id: str = "hermes_default"` | Semantic retrieval over Kùzu graph, Qdrant vectors, and verified KV with $<3\text{ ms}$ latency.<br>`{"status": "ok", "records": [...], "count": int}` |
+| **`atlas_recall`** | `query: str`, `session_id: str = "hermes_default"` | Semantic retrieval over Kùzu graph, Qdrant vectors, and verified KV with <3 ms latency.<br>`{"status": "ok", "records": [...], "count": int}` |
 | **`atlas_remember`** | `key: str`, `value: str`, `confidence: float = 1.0`, `reason: str` | Writes state variables directly to SQLite ledger with **SHA-256 Merkle chain verification**.<br>`{"status": "ok", "persisted": true, "entry_hash": "..."}` |
 | **`atlas_what_if`** | `entity: str`, `action: str`, `depth: int = 2` | Simulates multi-hop causal consequences and detects Critical Points of Failure (**CPoF**).<br>`{"status": "ok", "causal_paths": [...], "paths_count": int}` |
 | **`atlas_active_sensing`** | `probe: str`, `expected_value: str`, `observed_value: str` | Predictive coding sensor detecting environment discrepancies and raising critical alarms.<br>`{"status": "ok", "has_error": bool, "prediction_error": {...}}` |
@@ -550,7 +550,7 @@ ATLAS-Memory/
 │   ├── l3_procedural/            # SleepBaker, SkillCompiler, MemoryAuditor
 │   ├── causal/                   # RetroCausalEngine, Perturbation Diffusion, CPoF Detection
 │   ├── quantization/             # RaBitQ 32× Vector Engine, MIB Quantizer, AVX-512 SIMD
-│   ├── sync/                     # BFT-CRDT, Threshold Signatures ($2f+1$), UDP Gossip
+│   ├── sync/                     # BFT-CRDT, Threshold Signatures (2f+1), UDP Gossip
 │   ├── server/                   # AtlasDaemon (Unix Domain Socket IPC Server)
 │   └── arrow_buffer/             # Apache Arrow zero-copy memory buffers
 │
