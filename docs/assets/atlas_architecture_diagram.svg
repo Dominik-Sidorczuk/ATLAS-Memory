@@ -1,0 +1,372 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1600 1060" width="100%" height="100%" style="background:#090D16;font-family:-apple-system,BlinkMacSystemFont,'Inter','SF Pro Display','Segoe UI',Helvetica,sans-serif;">
+  <defs>
+    <marker id="arr-c" viewBox="0 0 10 10" refX="6" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M 0 1 L 10 5 L 0 9 z" fill="#00E5FF"/>
+    </marker>
+    <marker id="arr-g" viewBox="0 0 10 10" refX="6" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M 0 1 L 10 5 L 0 9 z" fill="#64748B"/>
+    </marker>
+  </defs>
+
+  <!-- Canvas Background -->
+  <rect width="1600" height="1060" fill="#090D16"/>
+
+  <!-- ===================================================================== -->
+  <!-- HEADER & SYSTEM METRICS -->
+  <!-- ===================================================================== -->
+  <g transform="translate(60, 40)">
+    <text x="0" y="28" font-size="24" font-weight="900" fill="#F8FAFC" letter-spacing="0.5">ATLAS System Architecture &amp; Dataflow Blueprint</text>
+    <text x="0" y="52" font-size="13" font-weight="500" fill="#94A3B8">Two-Runtime Isolated Architecture • 4-Tier Cognitive Vault • Epistemic Knapsack • BFT-CRDT Mesh</text>
+    
+    <!-- Specs Tags -->
+    <g transform="translate(940, 6)">
+      <rect x="0" y="0" width="165" height="32" rx="6" fill="#111827" stroke="#1F2937" stroke-width="1"/>
+      <circle cx="16" cy="16" r="4" fill="#00E5FF"/>
+      <text x="28" y="21" font-size="11" font-weight="700" fill="#E5E7EB">Engine: Py 3.14 No-GIL</text>
+
+      <rect x="175" y="0" width="160" height="32" rx="6" fill="#111827" stroke="#1F2937" stroke-width="1"/>
+      <circle cx="191" cy="16" r="4" fill="#10B981"/>
+      <text x="203" y="21" font-size="11" font-weight="700" fill="#E5E7EB">UDS Latency: &lt; 15 µs</text>
+
+      <rect x="345" y="0" width="195" height="32" rx="6" fill="#111827" stroke="#1F2937" stroke-width="1"/>
+      <circle cx="361" cy="16" r="4" fill="#A855F7"/>
+      <text x="373" y="21" font-size="11" font-weight="700" fill="#E5E7EB">BFT-CRDT (AES-256)</text>
+    </g>
+  </g>
+
+  <!-- ===================================================================== -->
+  <!-- COLUMN 1: HERMES AGENT HOST (Python 3.11+) -->
+  <!-- ===================================================================== -->
+  <g transform="translate(60, 115)">
+    <rect width="320" height="730" rx="10" fill="#0E131F" stroke="#1E293B" stroke-width="1.5"/>
+    <rect x="0" y="0" width="320" height="46" rx="10" fill="#151D2E"/>
+    <rect x="0" y="0" width="320" height="3" fill="#0284C7"/>
+    <text x="18" y="28" font-size="15" font-weight="800" fill="#F8FAFC">Hermes Agent Host</text>
+    <rect x="235" y="13" width="70" height="20" rx="4" fill="#0284C7" opacity="0.25"/>
+    <text x="244" y="27" font-size="10" font-weight="700" fill="#38BDF8">Python 3.11+</text>
+
+    <!-- Sub-block 1 -->
+    <g transform="translate(16, 60)">
+      <rect width="288" height="120" rx="8" fill="#121826" stroke="#1E293B" stroke-width="1"/>
+      <text x="14" y="24" font-size="12" font-weight="700" fill="#38BDF8">Dialogue &amp; Turn Stream</text>
+      <text x="14" y="44" font-size="11" fill="#94A3B8">• User prompt ingestion &amp; context build</text>
+      <text x="14" y="62" font-size="11" fill="#94A3B8">• Asynchronous background turn queue</text>
+      <text x="14" y="80" font-size="11" fill="#94A3B8">• Session state tracking &amp; metadata</text>
+      <text x="14" y="102" font-size="10" fill="#64748B">Source: <tspan font-family="monospace">hermes_agent/core/session.py</tspan></text>
+    </g>
+
+    <!-- Sub-block 2 -->
+    <g transform="translate(16, 195)">
+      <rect width="288" height="155" rx="8" fill="#121826" stroke="#1E293B" stroke-width="1"/>
+      <text x="14" y="24" font-size="12" font-weight="700" fill="#38BDF8">Memory Client Interface</text>
+      <text x="14" y="44" font-size="11" fill="#94A3B8">• <tspan fill="#F1F5F9" font-family="monospace">AtlasMemoryProvider</tspan> (Sync API)</text>
+      <text x="14" y="62" font-size="11" fill="#94A3B8">• <tspan fill="#F1F5F9" font-family="monospace">HermesMemoryAdapter</tspan> (Async Hook)</text>
+      <text x="14" y="80" font-size="11" fill="#94A3B8">• Thread-local non-blocking UDS Client</text>
+      <text x="14" y="98" font-size="11" fill="#94A3B8">• Plugin dir: <tspan font-family="monospace">~/.hermes/plugins/atlas/</tspan></text>
+      <text x="14" y="128" font-size="10.5" font-weight="700" fill="#10B981">✓ Zero C++/SIMD env pollution</text>
+    </g>
+
+    <!-- Sub-block 3 -->
+    <g transform="translate(16, 365)">
+      <rect width="288" height="155" rx="8" fill="#121826" stroke="#1E293B" stroke-width="1"/>
+      <text x="14" y="24" font-size="12" font-weight="700" fill="#38BDF8">Prompt Assembly Engine</text>
+      <text x="14" y="44" font-size="11" fill="#94A3B8">• Injects immutable contract prefix</text>
+      <text x="14" y="62" font-size="11" fill="#94A3B8">• Dynamically inserts recalled memory facts</text>
+      <text x="14" y="80" font-size="11" fill="#94A3B8">• Per-conversation KV prompt cache tuning</text>
+      <text x="14" y="104" font-size="11" font-weight="700" fill="#F59E0B">⚡ ~90% KV Cache Hit Rate</text>
+      <text x="14" y="126" font-size="10.5" fill="#64748B">Saves 60–80% input token latency</text>
+    </g>
+
+    <!-- Sub-block 4 -->
+    <g transform="translate(16, 535)">
+      <rect width="288" height="175" rx="8" fill="#121826" stroke="#1E293B" stroke-width="1"/>
+      <text x="14" y="24" font-size="12" font-weight="700" fill="#38BDF8">Tool Execution Runtime</text>
+      <text x="14" y="44" font-size="11" fill="#94A3B8">• <tspan fill="#F1F5F9" font-family="monospace">search_memory(k=5)</tspan></text>
+      <text x="14" y="62" font-size="11" fill="#94A3B8">• <tspan fill="#F1F5F9" font-family="monospace">commit_observation(conf)</tspan></text>
+      <text x="14" y="80" font-size="11" fill="#94A3B8">• Executable procedural skill handler</text>
+      <text x="14" y="98" font-size="11" fill="#94A3B8">• Skills dir: <tspan font-family="monospace">~/.hermes/skills/</tspan></text>
+      <text x="14" y="122" font-size="10.5" font-weight="700" fill="#38BDF8">✓ Live runtime hot-reload</text>
+      <text x="14" y="142" font-size="10" fill="#64748B">Sandbox AST verification before exec</text>
+    </g>
+  </g>
+
+  <!-- ===================================================================== -->
+  <!-- UDS IPC BRIDGE -->
+  <!-- ===================================================================== -->
+  <g transform="translate(380, 450)">
+    <rect x="0" y="-35" width="70" height="70" rx="8" fill="#111827" stroke="#1F2937" stroke-width="1"/>
+    <text x="35" y="-14" font-size="10" font-weight="800" fill="#00E5FF" text-anchor="middle">UDS IPC</text>
+    <text x="35" y="4" font-size="8.5" font-family="monospace" fill="#94A3B8" text-anchor="middle">atlas.sock</text>
+    <text x="35" y="22" font-size="10" font-weight="800" fill="#10B981" text-anchor="middle">&lt; 15 µs</text>
+
+    <!-- Arrows -->
+    <line x1="-12" y1="-10" x2="-2" y2="-10" stroke="#00E5FF" stroke-width="2" marker-end="url(#arr-c)"/>
+    <line x1="72" y1="-10" x2="82" y2="-10" stroke="#00E5FF" stroke-width="2" marker-end="url(#arr-c)"/>
+    <line x1="82" y1="10" x2="72" y2="10" stroke="#64748B" stroke-width="2" marker-end="url(#arr-g)"/>
+    <line x1="-2" y1="10" x2="-12" y2="10" stroke="#64748B" stroke-width="2" marker-end="url(#arr-g)"/>
+  </g>
+
+  <!-- ===================================================================== -->
+  <!-- COLUMN 2: ATLAS COGNITIVE ORCHESTRATOR -->
+  <!-- ===================================================================== -->
+  <g transform="translate(450, 115)">
+    <rect width="410" height="730" rx="10" fill="#0E131F" stroke="#1E293B" stroke-width="1.5"/>
+    <rect x="0" y="0" width="410" height="46" rx="10" fill="#161B30"/>
+    <rect x="0" y="0" width="410" height="3" fill="#4F46E5"/>
+    <text x="18" y="28" font-size="15" font-weight="800" fill="#F8FAFC">ATLAS Cognitive Orchestrator</text>
+    <rect x="300" y="13" width="95" height="20" rx="4" fill="#4F46E5" opacity="0.25"/>
+    <text x="308" y="27" font-size="10" font-weight="700" fill="#818CF8">DAEMON CORE</text>
+
+    <!-- Lever 1 -->
+    <g transform="translate(16, 60)">
+      <rect width="378" height="120" rx="8" fill="#131828" stroke="#1E293B" stroke-width="1"/>
+      <rect x="12" y="12" width="22" height="22" rx="4" fill="#4F46E5"/>
+      <text x="23" y="27" font-size="11" font-weight="800" fill="#FFFFFF" text-anchor="middle">1</text>
+      <text x="42" y="27" font-size="12.5" font-weight="700" fill="#F1F5F9">Retrieval Policy Gate</text>
+      <rect x="290" y="12" width="76" height="20" rx="4" fill="#059669" opacity="0.2"/>
+      <text x="298" y="26" font-size="9.5" font-weight="700" fill="#34D399">P50 &lt; 5.97 µs</text>
+      
+      <text x="14" y="54" font-size="11" fill="#94A3B8">• Fast deterministic entity &amp; intention classifier</text>
+      <text x="14" y="72" font-size="11" fill="#94A3B8">• Screens out 95% casual chatter → <tspan fill="#34D399" font-weight="700">0 injected tokens</tspan></text>
+      <text x="14" y="90" font-size="11" fill="#94A3B8">• Dispatches downstream recall only when needed</text>
+      <text x="14" y="108" font-size="10" fill="#64748B">SLA Bound: Sub-6 microsecond execution guarantee</text>
+    </g>
+
+    <!-- Lever 2 -->
+    <g transform="translate(16, 192)">
+      <rect width="378" height="120" rx="8" fill="#131828" stroke="#1E293B" stroke-width="1"/>
+      <rect x="12" y="12" width="22" height="22" rx="4" fill="#4F46E5"/>
+      <text x="23" y="27" font-size="11" font-weight="800" fill="#FFFFFF" text-anchor="middle">2</text>
+      <text x="42" y="27" font-size="12.5" font-weight="700" fill="#F1F5F9">Epistemic Knapsack Optimizer</text>
+      <rect x="295" y="12" width="71" height="20" rx="4" fill="#4F46E5" opacity="0.25"/>
+      <text x="303" y="26" font-size="9.5" font-weight="700" fill="#818CF8">≤ 1500 tok</text>
+      
+      <text x="14" y="54" font-size="11" fill="#94A3B8">• 0/1 Knapsack Density: <tspan font-family="monospace">max Σ (Score / Tokens)</tspan></text>
+      <text x="14" y="72" font-size="11" fill="#94A3B8">• Veracity Hierarchy: <tspan fill="#E2E8F0" font-weight="600">USER (1.0) &gt; TOOL (0.8) &gt; AGENT (0.5)</tspan></text>
+      <text x="14" y="90" font-size="11" fill="#94A3B8">• Enforces strict token ceiling to prevent bloat</text>
+      <text x="14" y="108" font-size="10" fill="#64748B">Algorithm: Dynamic Programming + Greedy fast path</text>
+    </g>
+
+    <!-- Lever 3 -->
+    <g transform="translate(16, 324)">
+      <rect width="378" height="120" rx="8" fill="#131828" stroke="#1E293B" stroke-width="1"/>
+      <rect x="12" y="12" width="22" height="22" rx="4" fill="#4F46E5"/>
+      <text x="23" y="27" font-size="11" font-weight="800" fill="#FFFFFF" text-anchor="middle">3</text>
+      <text x="42" y="27" font-size="12.5" font-weight="700" fill="#F1F5F9">Prefix Cache Guard</text>
+      <rect x="295" y="12" width="71" height="20" rx="4" fill="#D97706" opacity="0.2"/>
+      <text x="304" y="26" font-size="9.5" font-weight="700" fill="#FBBF24">~90% Hit</text>
+      
+      <text x="14" y="54" font-size="11" fill="#94A3B8">• Enforces deterministic immutable prompt contract</text>
+      <text x="14" y="72" font-size="11" fill="#94A3B8">• Separates static prefix from dynamic memories</text>
+      <text x="14" y="90" font-size="11" fill="#94A3B8">• Real-time telemetry monitoring (<tspan font-family="monospace">CacheHitMonitor</tspan>)</text>
+      <text x="14" y="108" font-size="10" fill="#64748B">Maintains stable KV prompt state across multi-turn sessions</text>
+    </g>
+
+    <!-- Lever 4 -->
+    <g transform="translate(16, 456)">
+      <rect width="378" height="120" rx="8" fill="#131828" stroke="#1E293B" stroke-width="1"/>
+      <rect x="12" y="12" width="22" height="22" rx="4" fill="#4F46E5"/>
+      <text x="23" y="27" font-size="11" font-weight="800" fill="#FFFFFF" text-anchor="middle">4</text>
+      <text x="42" y="27" font-size="12.5" font-weight="700" fill="#F1F5F9">Active Sensing Engine</text>
+      <rect x="280" y="12" width="86" height="20" rx="4" fill="#059669" opacity="0.2"/>
+      <text x="288" y="26" font-size="9.5" font-weight="700" fill="#34D399">Zero-Logits</text>
+      
+      <text x="14" y="54" font-size="11" fill="#94A3B8">• Predictive coding via observation error checks</text>
+      <text x="14" y="72" font-size="11" fill="#94A3B8">• Detects environmental drift without logit access</text>
+      <text x="14" y="90" font-size="11" fill="#94A3B8">• Auto-updates beliefs and triggers active inquiry</text>
+      <text x="14" y="108" font-size="10" fill="#64748B">Black-box LLM compatible: works over any API provider</text>
+    </g>
+
+    <!-- Lever 5 -->
+    <g transform="translate(16, 588)">
+      <rect width="378" height="122" rx="8" fill="#131828" stroke="#1E293B" stroke-width="1"/>
+      <rect x="12" y="12" width="22" height="22" rx="4" fill="#4F46E5"/>
+      <text x="23" y="27" font-size="11" font-weight="800" fill="#FFFFFF" text-anchor="middle">5</text>
+      <text x="42" y="27" font-size="12.5" font-weight="700" fill="#F1F5F9">Retro-Causal Engine (JEPA)</text>
+      <rect x="290" y="12" width="76" height="20" rx="4" fill="#9333EA" opacity="0.2"/>
+      <text x="299" y="26" font-size="9.5" font-weight="700" fill="#C084FC">What-If</text>
+      
+      <text x="14" y="54" font-size="11" fill="#94A3B8">• Counterfactual simulation on causal dependency DAG</text>
+      <text x="14" y="72" font-size="11" fill="#94A3B8">• Critical Points of Failure (CPoF) blast radius analysis</text>
+      <text x="14" y="90" font-size="11" fill="#94A3B8">• Thermodynamic energy self-annealing prevents cascade</text>
+      <text x="14" y="108" font-size="10" fill="#64748B">Simulates 30-node perturbation waves in 0.049 ms</text>
+    </g>
+  </g>
+
+  <!-- ===================================================================== -->
+  <!-- MEMORY BUS -->
+  <!-- ===================================================================== -->
+  <g transform="translate(860, 450)">
+    <rect x="0" y="-35" width="60" height="70" rx="8" fill="#111827" stroke="#1F2937" stroke-width="1"/>
+    <text x="30" y="-12" font-size="9" font-weight="800" fill="#94A3B8" text-anchor="middle">MEMORY</text>
+    <text x="30" y="4" font-size="8" font-family="monospace" fill="#64748B" text-anchor="middle">Zero-Copy</text>
+    <text x="30" y="20" font-size="9" font-weight="800" fill="#00E5FF" text-anchor="middle">BUS</text>
+
+    <!-- Branch lines -->
+    <line x1="-8" y1="0" x2="-2" y2="0" stroke="#64748B" stroke-width="2"/>
+    <line x1="62" y1="-18" x2="72" y2="-18" stroke="#9333EA" stroke-width="2" marker-end="url(#arr-g)"/>
+    <line x1="62" y1="-6" x2="72" y2="-6" stroke="#059669" stroke-width="2" marker-end="url(#arr-g)"/>
+    <line x1="62" y1="6" x2="72" y2="6" stroke="#2563EB" stroke-width="2" marker-end="url(#arr-g)"/>
+    <line x1="62" y1="18" x2="72" y2="18" stroke="#D97706" stroke-width="2" marker-end="url(#arr-g)"/>
+  </g>
+
+  <!-- ===================================================================== -->
+  <!-- COLUMN 3: 4-TIER COGNITIVE MEMORY VAULT -->
+  <!-- ===================================================================== -->
+  <g transform="translate(930, 115)">
+    <rect width="610" height="730" rx="10" fill="#0E131F" stroke="#1E293B" stroke-width="1.5"/>
+    <rect x="0" y="0" width="610" height="46" rx="10" fill="#12201B"/>
+    <rect x="0" y="0" width="610" height="3" fill="#059669"/>
+    <text x="18" y="28" font-size="15" font-weight="800" fill="#F8FAFC">4-Tier Cognitive Memory Vault</text>
+    <rect x="445" y="13" width="145" height="20" rx="4" fill="#059669" opacity="0.25"/>
+    <text x="453" y="27" font-size="10" font-weight="700" fill="#34D399">HARDWARE ACCELERATED</text>
+
+    <!-- LAYER 3: PROCEDURAL -->
+    <g transform="translate(16, 60)">
+      <rect width="578" height="150" rx="8" fill="#141021" stroke="#25173B" stroke-width="1"/>
+      <rect x="0" y="0" width="4" height="150" rx="2" fill="#9333EA"/>
+      <text x="16" y="22" font-size="13" font-weight="800" fill="#C084FC">LAYER 3: PROCEDURAL MEMORY (SOPs &amp; Skills)</text>
+      <text x="16" y="38" font-size="10.5" fill="#A855F7">Autonomous Skill Compilation &amp; Sleep-Cycle Distillation</text>
+
+      <g transform="translate(16, 50)">
+        <rect width="262" height="86" rx="6" fill="#0E0B17" stroke="#25173B" stroke-width="1"/>
+        <text x="12" y="20" font-size="11.5" font-weight="700" fill="#E9D5FF">SleepBaker (Consolidator)</text>
+        <text x="12" y="38" font-size="10" fill="#94A3B8">• Session turn mining &amp; deduplication</text>
+        <text x="12" y="52" font-size="10" fill="#94A3B8">• Compiles success rate &gt; 85% SOPs</text>
+        <text x="12" y="70" font-size="9.5" fill="#64748B">Idle consolidation in 0.065 ms</text>
+      </g>
+
+      <g transform="translate(294, 50)">
+        <rect width="268" height="86" rx="6" fill="#0E0B17" stroke="#25173B" stroke-width="1"/>
+        <text x="12" y="20" font-size="11.5" font-weight="700" fill="#E9D5FF">SkillCompiler (AST Gate)</text>
+        <text x="12" y="38" font-size="10" fill="#94A3B8">• Generates <tspan font-family="monospace">SKILL.md</tspan> + <tspan font-family="monospace">handler.py</tspan></text>
+        <text x="12" y="52" font-size="10" fill="#94A3B8">• <tspan font-family="monospace">ASTSafetyScanner</tspan> blocks unsafe calls</text>
+        <text x="12" y="70" font-size="9.5" fill="#34D399">Atomic manifest: <tspan font-family="monospace">skills_manifest.json</tspan></text>
+      </g>
+    </g>
+
+    <!-- LAYER 2: SEMANTIC -->
+    <g transform="translate(16, 225)">
+      <rect width="578" height="155" rx="8" fill="#0B1713" stroke="#123328" stroke-width="1"/>
+      <rect x="0" y="0" width="4" height="155" rx="2" fill="#059669"/>
+      <text x="16" y="22" font-size="13" font-weight="800" fill="#34D399">LAYER 2: SEMANTIC MEMORY (Dual-Engine Store)</text>
+      <text x="16" y="38" font-size="10.5" fill="#10B981">Topological Knowledge Graph + Hardware Sub-Byte Quantized Vectors</text>
+
+      <g transform="translate(16, 50)">
+        <rect width="170" height="90" rx="6" fill="#06100D" stroke="#123328" stroke-width="1"/>
+        <text x="10" y="18" font-size="11" font-weight="700" fill="#A7F3D0">Kùzu Graph Store</text>
+        <text x="10" y="34" font-size="9.5" fill="#94A3B8">• Typed entities &amp; edges</text>
+        <text x="10" y="48" font-size="9.5" fill="#94A3B8">• Multi-hop Cypher paths</text>
+        <text x="10" y="62" font-size="9.5" fill="#94A3B8">• O(1) indexed traversal</text>
+        <text x="10" y="78" font-size="9.5" fill="#34D399">Fast local C++ engine</text>
+      </g>
+
+      <g transform="translate(196, 50)">
+        <rect width="180" height="90" rx="6" fill="#06100D" stroke="#123328" stroke-width="1"/>
+        <text x="10" y="18" font-size="11" font-weight="700" fill="#A7F3D0">RaBitQ 32x / 8x + MIB</text>
+        <text x="10" y="34" font-size="9.5" fill="#94A3B8">• AVX-512 SIMD popcount</text>
+        <text x="10" y="48" font-size="9.5" fill="#94A3B8">• Matryoshka shortlist</text>
+        <text x="10" y="62" font-size="9.5" fill="#94A3B8">• 32x RAM compression</text>
+        <text x="10" y="78" font-size="9.5" fill="#34D399">1.46M scans / sec</text>
+      </g>
+
+      <g transform="translate(386, 50)">
+        <rect width="176" height="90" rx="6" fill="#06100D" stroke="#123328" stroke-width="1"/>
+        <text x="10" y="18" font-size="11" font-weight="700" fill="#A7F3D0">Verified KV Store</text>
+        <text x="10" y="34" font-size="9.5" fill="#94A3B8">• SQLite ACID variables</text>
+        <text x="10" y="48" font-size="9.5" fill="#94A3B8">• SHA-256 Hash-Chain</text>
+        <text x="10" y="62" font-size="9.5" fill="#94A3B8">• Tamper-evident ledger</text>
+        <text x="10" y="78" font-size="9.5" fill="#34D399">0.700 ms verification</text>
+      </g>
+    </g>
+
+    <!-- LAYER 1: WORKING -->
+    <g transform="translate(16, 395)">
+      <rect width="578" height="150" rx="8" fill="#0E1527" stroke="#18233C" stroke-width="1"/>
+      <rect x="0" y="0" width="4" height="150" rx="2" fill="#2563EB"/>
+      <text x="16" y="22" font-size="13" font-weight="800" fill="#60A5FA">LAYER 1: WORKING MEMORY (Latent Dynamics &amp; Streaming)</text>
+      <text x="16" y="38" font-size="10.5" fill="#3B82F6">JEPA Latent World Model &amp; Apache Arrow Columnar Trajectory Buffer</text>
+
+      <g transform="translate(16, 50)">
+        <rect width="262" height="86" rx="6" fill="#080D1A" stroke="#18233C" stroke-width="1"/>
+        <text x="12" y="20" font-size="11.5" font-weight="700" fill="#BFDBFE">JEPA World Model</text>
+        <text x="12" y="38" font-size="10" fill="#94A3B8">• Latent space: <tspan font-family="monospace">s_(t+1) = P(s_t, a_t)</tspan></text>
+        <text x="12" y="52" font-size="10" fill="#94A3B8">• System 2 rollouts without LLM tokens</text>
+        <text x="12" y="70" font-size="9.5" fill="#60A5FA">Energy Module scoring</text>
+      </g>
+
+      <g transform="translate(294, 50)">
+        <rect width="268" height="86" rx="6" fill="#080D1A" stroke="#18233C" stroke-width="1"/>
+        <text x="12" y="20" font-size="11.5" font-weight="700" fill="#BFDBFE">Arrow Columnar Buffer</text>
+        <text x="12" y="38" font-size="10" fill="#94A3B8">• Zero-copy slice on PyArrow RecordBatch</text>
+        <text x="12" y="52" font-size="10" fill="#94A3B8">• ZSTD &amp; Snappy Parquet streaming</text>
+        <text x="12" y="70" font-size="9.5" fill="#60A5FA">Matrix reshape via <tspan font-family="monospace">.flatten()</tspan></text>
+      </g>
+    </g>
+
+    <!-- LAYER 0: DYNAMIC FASTMATH -->
+    <g transform="translate(16, 560)">
+      <rect width="578" height="155" rx="8" fill="#181107" stroke="#332009" stroke-width="1"/>
+      <rect x="0" y="0" width="4" height="155" rx="2" fill="#D97706"/>
+      <text x="16" y="22" font-size="13" font-weight="800" fill="#FBBF24">LAYER 0: DYNAMIC FASTMATH CORE (Sub-Millisecond Kernels)</text>
+      <text x="16" y="38" font-size="10.5" fill="#F59E0B">Test-Time Training (TTT) &amp; Numba JIT Bit-Twiddling SIMD Scan</text>
+
+      <g transform="translate(16, 50)">
+        <rect width="262" height="90" rx="6" fill="#0F0A02" stroke="#332009" stroke-width="1"/>
+        <text x="12" y="20" font-size="11.5" font-weight="700" fill="#FDE68A">TTT Layer (Test-Time Training)</text>
+        <text x="12" y="38" font-size="10" fill="#94A3B8">• Dynamic weight adaptation in-context</text>
+        <text x="12" y="52" font-size="10" fill="#94A3B8">• Online gradient step without full backprop</text>
+        <text x="12" y="68" font-size="10" fill="#94A3B8">• Latency SLA: <tspan fill="#FBBF24" font-weight="700">P50 &lt; 85 µs</tspan></text>
+        <text x="12" y="82" font-size="9.5" fill="#F59E0B">Weight matrix update in microsecond</text>
+      </g>
+
+      <g transform="translate(294, 50)">
+        <rect width="268" height="90" rx="6" fill="#0F0A02" stroke="#332009" stroke-width="1"/>
+        <text x="12" y="20" font-size="11.5" font-weight="700" fill="#FDE68A">Numba JIT SWAR Kernels</text>
+        <text x="12" y="38" font-size="10" fill="#94A3B8">• Hardware SIMD bit-level popcount</text>
+        <text x="12" y="52" font-size="10" fill="#94A3B8">• Parallel asymmetric Hamming scan</text>
+        <text x="12" y="68" font-size="10" fill="#94A3B8">• Throughput: <tspan fill="#FBBF24" font-weight="700">&gt; 1.46M scans/sec</tspan></text>
+        <text x="12" y="82" font-size="9.5" fill="#F59E0B">Zero Python GIL overhead</text>
+      </g>
+    </g>
+  </g>
+
+  <!-- ===================================================================== -->
+  <!-- BOTTOM SECTION: DISTRIBUTED BFT-CRDT SYNC MESH -->
+  <!-- ===================================================================== -->
+  <g transform="translate(60, 865)">
+    <rect width="1480" height="145" rx="10" fill="#091311" stroke="#0F2B26" stroke-width="1.5"/>
+    <rect x="0" y="0" width="1480" height="3" fill="#0D9488"/>
+
+    <text x="24" y="28" font-size="14" font-weight="800" fill="#2DD4BF">CROSS-CLUSTER LAYER: BFT-CRDT DISTRIBUTED GOSSIP SYNC MESH</text>
+    <text x="24" y="46" font-size="11" fill="#94A3B8">Byzantine Fault Tolerant P2P Multi-Agent Knowledge Synchronization with Hardware-Accelerated AEAD Encryption</text>
+
+    <g transform="translate(24, 60)">
+      <rect width="345" height="70" rx="6" fill="#050D0C" stroke="#0F2B26" stroke-width="1"/>
+      <text x="14" y="22" font-size="11.5" font-weight="700" fill="#5EEAD4">Delta-CRDT (BFTLWWSet)</text>
+      <text x="14" y="40" font-size="10" fill="#94A3B8">• Vector Clocks + LWW conflict resolution</text>
+      <text x="14" y="56" font-size="9.5" fill="#64748B">Convergence verified in 0.069 ms</text>
+    </g>
+
+    <g transform="translate(390, 60)">
+      <rect width="345" height="70" rx="6" fill="#050D0C" stroke="#0F2B26" stroke-width="1"/>
+      <text x="14" y="22" font-size="11.5" font-weight="700" fill="#5EEAD4">Threshold Signatures (2f + 1)</text>
+      <text x="14" y="40" font-size="10" fill="#94A3B8">• Byzantine quorum validation on mutations</text>
+      <text x="14" y="56" font-size="9.5" fill="#64748B">HMAC-SHA256 &amp; Ed25519 threshold verification</text>
+    </g>
+
+    <g transform="translate(755, 60)">
+      <rect width="345" height="70" rx="6" fill="#050D0C" stroke="#0F2B26" stroke-width="1"/>
+      <text x="14" y="22" font-size="11.5" font-weight="700" fill="#5EEAD4">Epistemic Reputation (R ≥ 0.5)</text>
+      <text x="14" y="40" font-size="10" fill="#94A3B8">• Dynamic scoring: auto-evicts rogue peers</text>
+      <text x="14" y="56" font-size="9.5" fill="#64748B">Punishes Byzantine poisoned deltas</text>
+    </g>
+
+    <g transform="translate(1120, 60)">
+      <rect width="345" height="70" rx="6" fill="#050D0C" stroke="#0F2B26" stroke-width="1"/>
+      <text x="14" y="22" font-size="11.5" font-weight="700" fill="#5EEAD4">UDP Gossip &amp; AES-256-GCM</text>
+      <text x="14" y="40" font-size="10" fill="#94A3B8">• Authenticated AEAD encrypted transport</text>
+      <text x="14" y="56" font-size="9.5" fill="#64748B">Low-overhead binary packet exchange</text>
+    </g>
+  </g>
+</svg>
