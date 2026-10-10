@@ -10,11 +10,11 @@ from pathlib import Path
 import numpy as np
 import pytest
 
+from atlas_memory.core.models import MemoryRecord
 from atlas_memory.engine import HybridMemoryEngine
 from atlas_memory.l2_semantic.kuzu_graph import KuzuGraphStore
 from atlas_memory.l2_semantic.kv_store import VerifiedKVStore
 from atlas_memory.l2_semantic.qdrant_store import QdrantVectorStore
-from atlas_memory.models import MemoryRecord
 
 
 @pytest.mark.asyncio
@@ -217,7 +217,7 @@ def test_verified_kv_store_audit_log_sync():
 
 def test_qdrant_ngram_hashing_deterministic():
     """Weryfikacja deterministycznego rzutowania n-gramów w QdrantVectorStore."""
-    store = QdrantVectorStore(dimension=32)
+    store = QdrantVectorStore(location=":memory:", dimension=32)  # V70: bez location test pisal do PRODUKCJI (~/.hermes/atlas/qdrant)
     vec1 = store.encoder.encode("PostgreSQL configuration database port 5432")
     vec2 = store.encoder.encode("PostgreSQL configuration database port 5432")
 
@@ -398,7 +398,7 @@ def test_t8_t10_heal_audit_log_chain_and_clamp_confidence(tmp_path: Path):
     assert not is_valid
     assert err_seq == 2
 
-    deleted_probes = kv.purge_stale_probe_keys()
+    deleted_probes = kv.purge_stale_probe_keys(["huge:value", "test:adv:%", "knapsack:%"])
     assert deleted_probes >= 2
     assert kv.get_sync("huge:value") is None
     assert kv.get_sync("test:adv:probe") is None
@@ -417,4 +417,119 @@ def test_t8_t10_heal_audit_log_chain_and_clamp_confidence(tmp_path: Path):
     row = cursor.fetchone()
     assert row is not None
     assert float(row[0]) <= 1.0
+
+
+def test_multidigraph_preserves_multiple_predicates(tmp_path: Path) -> None:
+    graph = KuzuGraphStore(db_path=str(tmp_path / "kuzu_multi"))
+    try:
+        graph.add_relation("EntityA", "causes", "EntityB", confidence=0.8, timestamp=100.0)
+        graph.add_relation("EntityA", "supports", "EntityB", confidence=0.6, timestamp=110.0)
+        graph.add_relation("EntityA", "precedes", "EntityB", confidence=0.4, timestamp=120.0)
+        assert graph.nx_graph.number_of_edges() == 3
+        all_rels = graph.get_all_relations()
+        assert len(all_rels) == 3
+        preds = {r["predicate"] for r in all_rels}
+        assert preds == {"causes", "supports", "precedes"}
+    finally:
+        graph.close()
+
+
+def test_sqlite_split_attached_audit_log(tmp_path: Path) -> None:
+    db_file = tmp_path / "atlas.db"
+    kv = VerifiedKVStore(db_path=str(db_file))
+    try:
+        kv.set_sync("pref:theme", "dark", confidence=1.0)
+        assert Path(kv.audit_db_path).exists()
+        is_valid, broken_seq = kv.verify_audit_log_sync()
+        assert is_valid is True
+        assert broken_seq == 0
+    finally:
+        import asyncio
+        asyncio.run(kv.close())
+
+
+def test_kuzu_wal_checkpoint_on_close(tmp_path: Path) -> None:
+    db_dir = tmp_path / "kuzu_wal"
+    graph = KuzuGraphStore(db_path=str(db_dir))
+    try:
+        graph.add_relation("ServerA", "replicates", "ServerB", confidence=0.9)
+    finally:
+        graph.close()
+    wal_file = db_dir / "wal"
+    if wal_file.exists():
+        assert wal_file.stat().st_size == 0
+
+
+def test_kuzu_orphan_gc_does_not_detach_valid_edges(tmp_path: Path) -> None:
+    import asyncio
+    g = KuzuGraphStore(db_path=str(tmp_path / "kuzu_gc"))
+    assert g.conn is not None
+    try:
+        g.add_relation("A", "causes", "B", confidence=0.9)
+        g.conn.execute("MERGE (e:Entity {name: 'Sierota'})")
+        g.nx_graph.add_node("A")
+        g.nx_graph.add_node("B")
+        g.nx_graph.add_node("Sierota")
+        deleted = asyncio.run(g.garbage_collect_orphans())
+        assert deleted == 1
+        assert g.conn.execute("MATCH ()-[r:RELATION]->() RETURN count(r)").get_next()[0] == 1
+    finally:
+        g.close()
+
+
+def test_hydracja_odtwarza_caly_graf_i_jest_idempotentna(tmp_path: Path) -> None:
+    db_path = str(tmp_path / "kuzu_hydr")
+    g = KuzuGraphStore(db_path=db_path)
+    try:
+        for i in range(10):
+            g.add_relation(f"Ent{i:02d}", "causes", f"Effect{i:02d}", confidence=0.8)
+    finally:
+        g.close()
+
+    g2 = KuzuGraphStore(db_path=db_path)
+    try:
+        first = g2.hydrate_from_disk_sync()
+        assert first["kuzu_edges"] == 10
+        assert g2.nx_graph.number_of_edges() == 10
+        second = g2.hydrate_from_disk_sync()
+        assert second["kuzu_edges"] == 10
+        assert g2.nx_graph.number_of_edges() == 10
+    finally:
+        g2.close()
+
+
+@pytest.mark.asyncio
+async def test_qdrant_blake2b_id_sparse_and_canonical_kv_key(tmp_path: Path) -> None:
+    """Consolidated V90-V92 Qdrant invariants: Blake2b 63-bit ID, canonical kv_key payload, default collection, and sparse vector channel."""
+    from atlas_memory.l2_semantic.qdrant_store import (
+        QdrantVectorStore,
+        _point_id_for_key,
+        encode_sparse_document,
+    )
+
+    pid = _point_id_for_key("kv:rule:git:no_push")
+    assert pid == _point_id_for_key("kv:rule:git:no_push")
+    assert pid > (1 << 31)
+
+    sp1 = encode_sparse_document("Konfiguracja portu serwera Obsidian")
+    sp2 = encode_sparse_document("Konfiguracji portów serwerów Obsidian")
+    assert len(sp1.indices) > 0 and len(sp1.indices) == len(sp1.values)
+    assert set(sp1.indices) & set(sp2.indices)
+
+    store = QdrantVectorStore(location=":memory:", dimension=8)
+    assert store.collection_name in ("atlas_memories", "hermes_episodic_memory_68m")
+    try:
+        rec = MemoryRecord(
+            subject="rule:git:no_push",
+            predicate="stated_memory",
+            object="Never force push to main branch",
+            vector=[0.25] * 8,
+        )
+        store.insert_sync(rec, upsert_key="kv:rule:git:no_push")
+        hits = await store.search([0.25] * 8, top_k=5)
+        assert len(hits) == 1
+        assert hits[0].get("kv_key") == "rule:git:no_push"
+    finally:
+        store.close()
+
 

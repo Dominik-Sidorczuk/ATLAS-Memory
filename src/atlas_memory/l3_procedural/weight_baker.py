@@ -10,11 +10,8 @@ from pydantic import BaseModel, Field
 logger = logging.getLogger(__name__)
 
 
-try:
-    from peft import LoraConfig, TaskType
-    HAS_PEFT = True
-except ImportError:
-    HAS_PEFT = False
+# Module-level availability flag for PEFT config generation
+HAS_PEFT: bool = False
 
 
 class BakedProcedure(BaseModel):
@@ -38,7 +35,7 @@ class WeightBaker:
     Status: waiting-consumer (ADR-001).
     Identyfikuje powtarzające się skuteczne sekwencje akcji i kompiluje je
     w konfiguracje mikro-adapterów LoRA (PEFT) gotowe do dołączenia do modelu bazowego.
-    W przypadku braku środowiska PEFT zwraca w pełni bezpieczne słowniki zastępcze.
+    Zero-torch w runtime (AGENTS.md Reguła #5): generuje kanoniczny słownik PEFT LoraConfig.
     """
 
     BAKER_STATUS: str = "waiting-consumer"
@@ -71,26 +68,11 @@ class WeightBaker:
         })
 
     def _generate_peft_lora_config(self, signature: str) -> Dict[str, Any]:
-        """Generuje konfigurację LoRA przy użyciu biblioteki PEFT."""
-        if HAS_PEFT:
-            try:
-                cfg = LoraConfig(
-                    r=self.lora_rank,
-                    lora_alpha=self.lora_alpha,
-                    target_modules=["q_proj", "v_proj", "k_proj", "o_proj"],
-                    lora_dropout=0.05,
-                    bias="none",
-                    task_type=TaskType.CAUSAL_LM,
-                )
-                return cfg.to_dict()
-            except Exception as exc:
-                logger.debug("Failed to export PEFT LoraConfig to dict, using fallback: %s", exc)
-
-
+        """Generuje kanoniczną konfigurację LoRA zgodną ze schematem PEFT bez importu torch."""
         return {
             "r": self.lora_rank,
             "lora_alpha": self.lora_alpha,
-            "target_modules": ["q_proj", "v_proj"],
+            "target_modules": ["q_proj", "v_proj", "k_proj", "o_proj"],
             "lora_dropout": 0.05,
             "bias": "none",
             "task_type": "CAUSAL_LM",

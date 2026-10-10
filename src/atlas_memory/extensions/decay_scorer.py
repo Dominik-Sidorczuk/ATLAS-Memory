@@ -6,7 +6,7 @@ from typing import Optional
 
 import numpy as np
 
-from atlas_memory.models import MemoryRecord
+from atlas_memory.core.models import MemoryRecord
 
 
 class SalienceDecayEngine:

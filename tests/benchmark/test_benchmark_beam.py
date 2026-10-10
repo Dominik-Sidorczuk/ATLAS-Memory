@@ -10,6 +10,8 @@ from pathlib import Path
 
 import pytest
 
+pytestmark = pytest.mark.benchmark
+
 from atlas_memory.hermes.atlas_provider import AtlasMemoryProvider
 from atlas_memory.orchestrator import MemoryOrchestrator
 from scripts.run_beam_benchmark import (

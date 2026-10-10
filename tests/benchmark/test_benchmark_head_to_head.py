@@ -18,6 +18,8 @@ from pathlib import Path
 
 import pytest
 
+pytestmark = pytest.mark.benchmark
+
 BASELINES_DIR = Path(__file__).resolve().parent.parent.parent / "docs" / "baselines"
 PURE_JSON = BASELINES_DIR / "benchmark_baseline_mnemosyne_pure.json"
 ATLAS_JSON = BASELINES_DIR / "benchmark_baseline_atlas_real.json"

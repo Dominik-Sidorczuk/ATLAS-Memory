@@ -9,20 +9,20 @@ import tempfile
 import time
 from pathlib import Path
 
-import numpy as np
 import pytest
+
+pytestmark = pytest.mark.benchmark
 
 from atlas_memory.causal.models import DiffusionResult
 from atlas_memory.causal.retro_causal_edge import RetroCausalEngine
+from atlas_memory.core.models import EpistemicSource, MemoryRecord
 from atlas_memory.engine import HybridMemoryEngine
+from atlas_memory.ipc.uds_client import AtlasDaemonClient
 from atlas_memory.l2_semantic.kv_store import VerifiedKVStore
 from atlas_memory.l3_procedural.skill_compiler import ASTSafetyScanner, compile_sop_to_skill
 from atlas_memory.l3_procedural.sleep_baker import SleepBaker, StandardProcedure, Step
-from atlas_memory.models import EpistemicSource, MemoryRecord
 from atlas_memory.orchestrator import MemoryOrchestrator
-from atlas_memory.quantization import AVX512Hamming, MIBQuantizer
 from atlas_memory.server.atlas_daemon import AtlasDaemon
-from atlas_memory.server.client import AtlasDaemonClient
 from atlas_memory.sync.crdt import SyncDelta, VectorClock
 from atlas_memory.sync.crypto import SyncCrypto
 
@@ -288,28 +288,6 @@ def test_bench_13_crdt_delta_sync():
     assert vc_merged.clocks["agent_b"] == 7
     assert received_delta.payload["state"] == "synchronized"
     assert elapsed < 0.010, f"CRDT Delta Sync + AES-256-GCM took {elapsed*1000:.2f}ms >= 10ms"
-
-
-def test_bench_14_avx512_quantization_scan():
-    """14. [V14] AVX-512 / MIB Quantization: Hamming distance scan < 5ms per 1000 vectors."""
-    quantizer = MIBQuantizer()
-    np.random.seed(42)
-
-    # 1,000 wektorów 384-dim (48 bajtów uint64 per wektor)
-    raw_vecs = np.random.randn(1000, 384).astype(np.float32)
-    compressed_db = quantizer.compress(raw_vecs)
-    query_raw = np.random.randn(384).astype(np.float32)
-    q_vec = quantizer.quantize(query_raw)
-
-    # Warmup Numba JIT
-    _ = AVX512Hamming.batch_hamming(q_vec.data, compressed_db[:10])
-
-    start = time.perf_counter()
-    dists = AVX512Hamming.batch_hamming(q_vec.data, compressed_db)
-    elapsed = time.perf_counter() - start
-
-    assert dists.shape[0] == 1000
-    assert elapsed < 0.010, f"Hamming scan on 1000 vectors took {elapsed*1000:.2f}ms >= 10ms"
 
 
 def test_bench_15_autonomous_skill_compilation():

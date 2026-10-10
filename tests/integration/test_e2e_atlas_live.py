@@ -9,8 +9,8 @@ from pathlib import Path
 import pytest
 
 from atlas_memory.hermes.atlas_provider import AtlasMemoryProvider
+from atlas_memory.ipc.uds_client import AtlasDaemonClient
 from atlas_memory.server.atlas_daemon import AtlasDaemon
-from atlas_memory.server.client import AtlasDaemonClient
 
 
 def test_atlas_socket_reachable():
@@ -34,10 +34,11 @@ def test_atlas_memory_provider_import():
     assert provider.name == "atlas"
 
 
-def test_atlas_daemon_client_roundtrip(tmp_path: Path):
+def test_atlas_daemon_client_roundtrip(tmp_path: Path, uds_dir: Path):
     """Verify AtlasDaemon and AtlasDaemonClient can communicate over UDS."""
-    sock_path = tmp_path / "test_atlas.sock"
-    pid_path = tmp_path / "test_atlas.pid"
+    sock_path = uds_dir / "test_atlas.sock"
+    pid_path = uds_dir / "test_atlas.pid"
+    assert len(str(sock_path)) < 100, f"ścieżka testowego socketa UDS za długa: {sock_path}"
 
     async def _test():
         daemon = AtlasDaemon(socket_path=sock_path, pid_path=pid_path)

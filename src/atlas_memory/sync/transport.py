@@ -1,4 +1,14 @@
-"""Transport layer for Gossip Protocol synchronization across distributed agents."""
+"""Transport dla synchronizacji (uczciwa etykieta V67, F10).
+
+Produkcyjny DAEMON synchronizuje przez PULL-SYNC przez UDS RPC
+(server/atlas_daemon.py: sync_export_delta / sync_apply_delta / sync_peer_status)
+— protokół JSON-RPC 2.0 na gnieździe ~/.hermes/atlas.sock; UDP/InMemory
+GossipTransport to WARSTWA OPCJONALNA dla przyszłej siatki multi-agent i testów.
+Kontrakt: GossipTransport.send NIE posiada domyślnego transportu — gdy
+GossipSyncProtocol nie ma skonfigurowanego transportu, send_sync() rzuca
+RuntimeError („Cannot send sync: no GossipTransport configured”), zamiast
+po cichu gubić payload (patrz sync/protocol.py)."""
+
 
 from __future__ import annotations
 

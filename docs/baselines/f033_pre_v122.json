@@ -1,0 +1,33 @@
+{
+  "meta": {
+    "name": "f033_pre_v122",
+    "created": "2026-10-01T11:25:00+02:00",
+    "method": "live daemon + daemon.log mining + offline probes (nie z deklaracji agentow)",
+    "env": "python 3.14 (.pixi/envs/default), kuzu live UDS ~/.hermes/atlas.sock, daemon PID 110219 commit=f66d709 (V121)"
+  },
+  "graph_channel_pre_v122": {
+    "graph_ram_nodes": 1746,
+    "graph_ram_edges": 2178,
+    "pools_total_in_log": 31,
+    "pools_graph_zero": 21,
+    "pools_graph_zero_pct": 0.68,
+    "admitted_with_g_above_0p70": 0,
+    "note": "teza Antigravity 93% rekordow graph=0.00 dotyczyla admitted recordow; pomiar pooli = 68%; ten sam log, rozne denominatory. Cel po V122: <50%."
+  },
+  "exact_match_failures": {
+    "finding": "nx_graph.has_node(word) exact; _bilingual_stem(narzedzia)=narzedzi nie trafia w canon narzedzie; spaCy pl_core_news_sm: narzedzia->narzedzie, wazach->waza, wielowyrazowe encje zachowane (LOOP Engineering jako ent)",
+    "probe_queries": ["CORS", "cors", "narzędzia", "narzędzie", "LOOP Engineering", "LOOP"]
+  },
+  "spacy_assets": {
+    "spacy_version": "3.8.16",
+    "polish_model": "pl_core_news_sm (loaded OK; pl_core_news_lg/md ABSENT)",
+    "implication": "T1 uzywa spaCy do lematyzacji + NER encji; lg nie wymagane dla pilota V122"
+  },
+  "gm_hash_canary": {
+    "s3_collision_fingerprints_expected_hash": "18396978e674f39d",
+    "usage": "canary przed/po zmianach wag; drift hash = STOP; rekwalibracja wag = ADR-122 + update hash w tym samym commicie"
+  },
+  "limits": {
+    "node_names_survey": "BLOCKED: brak RPC eksportu nazw wezlow RAM; in-process GraphStore vs live daemon odrzucone (izolacja produkcji). Indeks O(1) zbudowany w Makerze T1 z nazw wezlow RAM at boot."
+  }
+}

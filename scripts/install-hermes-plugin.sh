@@ -74,7 +74,7 @@ log "Generowanie wrappera do ${PLUGIN_DIR}..."
 cat > "${PLUGIN_DIR}/plugin.yaml" <<'YAML'
 name: atlas
 version: 1.0.0
-description: "ATLAS Cognitive Memory Sidecar for Hermes — Zero-GIL Python 3.14 Micro-Daemon with Verified KV Ledger, Kùzu Graph, RaBitQ Vector Store, Retro-Causal What-If, and Active Sensing."
+description: "ATLAS Cognitive Memory Sidecar for Hermes — Zero-GIL Python 3.14 Micro-Daemon with Verified KV Ledger, Kùzu Graph, Retro-Causal What-If, and Active Sensing."
 author: Dominik Sidorczuk
 provides_tools:
   - atlas_recall
@@ -113,15 +113,24 @@ from pathlib import Path as _Path
 # Metadata used by hermes plugin status/loader.
 _PYTHON = '__HERMES_PYTHON__'
 _SITE = '__HERMES_SITE__'
-_SRC = '__ATLAS_SRC__'
-_PIXI_SITE = '__PIXI_SITE__'
+_SRC = os.environ.get("ATLAS_SRC") or '__ATLAS_SRC__'
+_PIXI_SITE = os.environ.get("ATLAS_PIXI_SITE") or '__PIXI_SITE__'
 
-if _SITE not in _sys.path:
-    _sys.path.append(_SITE)
-if _SRC not in _sys.path:
-    _sys.path.append(_SRC)
-if _PIXI_SITE not in _sys.path:
+if _sys.version_info[:2] != (3, 14):
+    _sys.path[:] = [p for p in _sys.path if "python3.14/site-packages" not in p]
+    if "atlas_memory.hermes.atlas_provider" not in _sys.modules:
+        for _mod_key in list(_sys.modules.keys()):
+            if _mod_key == "atlas_memory" or _mod_key.startswith("atlas_memory."):
+                _sys.modules.pop(_mod_key, None)
+elif _PIXI_SITE and _PIXI_SITE not in _sys.path and _Path(_PIXI_SITE).is_dir():
     _sys.path.append(_PIXI_SITE)
+
+# Try native package import first, fall back to repo _SRC
+try:
+    import atlas_memory  # noqa: F401
+except ImportError:
+    if _SRC and _Path(_SRC).is_dir() and _SRC not in _sys.path:
+        _sys.path.append(_SRC)
 
 # Hermes discovery marker: register_memory_provider / MemoryProvider
 from atlas_memory.hermes.atlas_provider import AtlasMemoryProvider  # noqa: E402,F401
@@ -132,45 +141,53 @@ except ImportError:
     MemoryProvider = object  # type: ignore
 
 
-_SOCKET_PATH = _Path.home() / ".hermes" / "atlas.sock"
-_LAUNCHER_SCRIPT = _Path(_SRC).parent / "scripts" / "atlas_daemon_launcher.py"
-_PIXI_BIN = _Path.home() / ".pixi" / "bin" / "pixi"
-if not _PIXI_BIN.exists():
-    _PIXI_BIN = "pixi"
+_SOCKET_PATH = _Path(os.environ.get("ATLAS_SOCKET_PATH") or (_Path.home() / ".hermes" / "atlas.sock"))
 
 
 def _is_daemon_alive() -> bool:
     """Verifies that the daemon is actively responding to JSON-RPC ping over UDS."""
     try:
-        from atlas_memory.server.client import send_uds_request_sync
-        res = send_uds_request_sync(_SOCKET_PATH, method="ping", timeout=0.2)
+        from atlas_memory.ipc.uds_client import send_uds_request_sync
+        res = send_uds_request_sync(_SOCKET_PATH, method="ping", timeout=0.25)
         return isinstance(res, dict) and res.get("status") == "ok"
     except Exception:
         return False
 
 
 def _ensure_daemon_running() -> None:
-    """Spawns AtlasDaemon in Python 3.14 via Pixi if not already responding."""
+    """Spawns AtlasDaemon in background if not already responding."""
     if _is_daemon_alive():
         return
     try:
-        logging.getLogger("atlas-plugin").info("Spawning ATLAS daemon in background...")
-        try:
-            if _SOCKET_PATH.exists():
-                _SOCKET_PATH.unlink(missing_ok=True)
-            pid_file = _SOCKET_PATH.with_suffix(".pid")
-            if pid_file.exists():
-                pid_file.unlink(missing_ok=True)
-        except Exception:
-            pass
+        from atlas_memory.hermes.daemon_bootstrap import ensure_daemon_running
+        if ensure_daemon_running(_SOCKET_PATH):
+            return
+    except Exception as exc:
+        logging.getLogger("atlas-plugin").debug("daemon_bootstrap attempt note: %s", exc)
 
-        repo_dir = _Path(_SRC).parent
+    try:
+        import shutil
+
+        repo_dir = _Path(_SRC).parent if (_SRC and _Path(_SRC).is_dir()) else _Path.home()
+        launcher_script = repo_dir / "scripts" / "atlas_daemon_launcher.py"
+
+        pixi_bin = _Path.home() / ".pixi" / "bin" / "pixi"
+        if not pixi_bin.exists():
+            which_pixi = shutil.which("pixi")
+            pixi_bin = _Path(which_pixi) if which_pixi else _Path("pixi")
+
         log_file = _Path.home() / ".hermes" / "atlas" / "daemon.log"
         log_file.parent.mkdir(parents=True, exist_ok=True)
         log_fp = open(str(log_file), "a", encoding="utf-8")
+
+        if launcher_script.exists() and (pixi_bin.exists() or shutil.which(str(pixi_bin))):
+            cmd = [str(pixi_bin), "run", "python", str(launcher_script)]
+        else:
+            cmd = [_sys.executable, "-m", "atlas_memory.server"]
+
         subprocess.Popen(
-            [str(_PIXI_BIN), "run", "python", str(_LAUNCHER_SCRIPT)],
-            cwd=str(repo_dir),
+            cmd,
+            cwd=str(repo_dir) if repo_dir.exists() else None,
             stdout=log_fp,
             stderr=log_fp,
             start_new_session=True,

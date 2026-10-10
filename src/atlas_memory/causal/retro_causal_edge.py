@@ -1,22 +1,12 @@
 from __future__ import annotations
 
+import inspect
 import logging
-import re
 from typing import Any, Dict, List, Optional, Set
 
 import numpy as np
 
 logger = logging.getLogger("atlas.causal.retro_causal_edge")
-
-EMAIL_PATTERN = re.compile(r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b')
-SENSITIVE_KEY_PATTERN = re.compile(r'(api_key|token|password|secret|clientprofile|bearer)', re.IGNORECASE)
-
-
-def is_pii_entity(text: str) -> bool:
-    """Returns True if text contains an email address or sensitive credential pattern."""
-    if not text:
-        return False
-    return bool(EMAIL_PATTERN.search(text) or SENSITIVE_KEY_PATTERN.search(text))
 
 from atlas_memory.causal.models import (
     CausalEdge,
@@ -24,9 +14,25 @@ from atlas_memory.causal.models import (
     CPoFNode,
     DiffusionNode,
     DiffusionResult,
-    WhatIfResult,
 )
-from atlas_memory.models import ActionPlan
+from atlas_memory.core.models import EMAIL_PATTERN, ActionPlan, is_pii_entity
+
+
+def _load_profile_critical_keywords() -> Set[str]:
+    try:
+        from atlas_memory.domain.registry import DomainProfileRegistry
+        kw = DomainProfileRegistry.get_instance().get_all_critical_keywords()
+        if kw:
+            return kw
+    except Exception as exc:
+        logger.debug("Could not load critical keywords from DomainProfileRegistry: %s", exc)
+    return {
+        "crash", "failure", "fatal", "broken", "corrupt", "leak", "deadlock",
+        "hazard", "toxic", "toxicity", "diminishing_returns", "danger",
+        "dose", "mg", "per_dose", "overdose", "dosage", "tumor", "hepatotoxic",
+        "lethal", "poison", "exceed", "limit", "truncate", "truncate_table",
+        "drop_table", "delete_all", "database", "flush_all", "destroy",
+    }
 
 
 class RetroCausalEngine:
@@ -45,15 +51,9 @@ class RetroCausalEngine:
         "critical_for", "requires", "authenticates", "mounts", "databases",
         "causes", "breaks", "blocks", "restricted_by", "requires_condition",
     }
-    DEFAULT_CRITICAL_KEYWORDS = {
-        "crash", "failure", "fatal", "broken", "corrupt", "leak", "deadlock",
-        "hazard", "toxic", "toxicity", "diminishing_returns", "danger",
-        "dose", "mg", "per_dose", "overdose", "dosage", "tumor", "hepatotoxic",
-        "lethal", "poison", "exceed", "limit", "truncate", "truncate_table",
-        "drop_table", "delete_all", "database", "flush_all", "destroy",
-    }
+    DEFAULT_CRITICAL_KEYWORDS = _load_profile_critical_keywords()
 
-    # Backward compatibility class-level references
+    # Canonical class-level attribute references
     CRITICAL_PREDICATES = DEFAULT_CRITICAL_PREDICATES
     CRITICAL_KEYWORDS = DEFAULT_CRITICAL_KEYWORDS
 
@@ -95,7 +95,7 @@ class RetroCausalEngine:
                 node_id=nid,
                 impact_score=round(stats["impact_score"], 6),
                 path_length=stats["path_length"],
-                cumulative_confidence=round(stats["cumulative_confidence"], 6),
+                cumulative_confidence=min(1.0, max(0.0, round(stats["cumulative_confidence"], 6))),
             )
             for nid, stats in node_stats.items()
         ]
@@ -116,20 +116,65 @@ class RetroCausalEngine:
         except Exception:
             return None
 
-    def _assess_path_risk(self, action: str, steps: List[CausalEdge], target: str, conf: float) -> str:
-        """Ocenia poziom ryzyka ścieżki przyczynowej na podstawie predykatów, słów kluczowych i pewności."""
+    def _assess_path_risk(
+        self,
+        action: str,
+        steps: List[CausalEdge],
+        target: str,
+        conf: float,
+        jepa_divergence: Optional[float] = None,
+        cpof_map: Optional[Dict[str, float]] = None,
+    ) -> str:
+        """
+        Ocenia poziom ryzyka ścieżki przyczynowej na podstawie ciągłego tensora JEPA-CPoF (V154 Filar II).
+        
+        risk_potential = delta_jepa * sum(step.confidence * cpof_severity(step.target))
+        Progi:
+        >= 0.70 -> CRITICAL
+        >= 0.40 -> HIGH
+        >= 0.15 -> MODERATE
+        inaczej -> LOW
+        """
         has_critical_pred = any(s.predicate in self.critical_predicates for s in steps)
-        is_action_critical = any(k in action.lower() for k in self.critical_keywords)
-        has_critical_keyword = is_action_critical or any(
-            any(k in s.target.lower() or k in s.predicate.lower() or k in s.source.lower() for k in self.critical_keywords)
-            for s in steps
-        )
-        is_target_hazardous = any(k in target.lower() for k in self.critical_keywords)
-        if is_target_hazardous or ((has_critical_pred or has_critical_keyword) and conf >= 0.7):
+        cpof_dict = cpof_map or {}
+
+        # 1. Obliczenie wag dotkniętych węzłów i relacji
+        accum_step_risk = 0.0
+        for s in steps:
+            node_severity = cpof_dict.get(s.target, 0.5 if s.predicate in self.critical_predicates else 0.2)
+            accum_step_risk += s.confidence * node_severity
+
+        # Bazowa dywergencja JEPA (domyślnie 1.0 jeśli brak modułu L1 JEPA)
+        jepa_factor = float(jepa_divergence) if jepa_divergence is not None else 1.0
+
+        # Wycena semantyczna akcji/celu (Zero-Shot Semantic Risk Assessor)
+        semantic_multiplier = 1.0
+        try:
+            from atlas_memory.causal.risk_assessor import SemanticRiskAssessor
+            assessor = SemanticRiskAssessor.get_instance()
+            lvl, a_conf = assessor.assess_action_risk(action)
+            if assessor.is_critical(action) or assessor.is_critical(target):
+                semantic_multiplier = 1.5
+            elif assessor.is_volatile(action):
+                semantic_multiplier = 1.2
+            elif lvl == "SAFE" and a_conf >= 0.5:
+                semantic_multiplier = 0.1
+        except Exception as exc:
+            logger.debug("SemanticRiskAssessor check failed: %s", exc)
+
+        norm_step_risk = accum_step_risk / max(1.0, float(len(steps)))
+        risk_potential = (jepa_factor * norm_step_risk * conf * semantic_multiplier)
+
+        if has_critical_pred and risk_potential < 0.40 and conf >= 0.70 and semantic_multiplier > 0.5:
+            risk_potential = max(risk_potential, 0.72)
+        elif has_critical_pred and risk_potential < 0.20 and conf >= 0.40 and semantic_multiplier > 0.5:
+            risk_potential = max(risk_potential, 0.45)
+
+        if risk_potential >= 0.70:
             return "CRITICAL"
-        elif (has_critical_pred or has_critical_keyword) and conf >= 0.4:
+        if risk_potential >= 0.40:
             return "HIGH"
-        elif conf >= 0.7:
+        if risk_potential >= 0.15:
             return "MODERATE"
         return "LOW"
 
@@ -142,8 +187,8 @@ class RetroCausalEngine:
         """
         Probabilistyczne rozchodzenie fali skutków przez graf zależności.
         Dla każdego węzła na ścieżce: impact = confidence * (decay_factor ** depth).
-        Obsługuje cykle (visited set per path + max_depth).
-        Gdy węzeł jest osiągany z wielu ścieżek, sumuje wpływ.
+        Zastąpiono wykładniczą rekurencję przeszukiwaniem warstwowym (BFS)
+        z dynamiczną agregacją wpływu O(d * (|V| + |E|)).
         """
         safe_depth = max(1, int(max_depth))
         safe_decay = max(0.0, min(1.0, float(decay_factor)))  # clamp01 scope: nie-confidence (waga/penalty)
@@ -167,53 +212,51 @@ class RetroCausalEngine:
         seen_edges: Set[tuple] = set()
         max_reached_depth = 0
 
-        def traverse(current_node: str, current_conf: float, current_depth: int, path_visited: Set[str]):
-            nonlocal max_reached_depth
-            if current_depth > safe_depth:
-                return
+        # Przeszukiwanie warstwowe z dynamiczną agregacją wpływu
+        current_layer: Dict[str, float] = {start_node: 1.0}
 
-            neighbors = adj.get(current_node, [])
-            for edge in neighbors:
-                tgt = edge["target"]
-                pred = edge["predicate"]
-                conf = edge["confidence"]
+        for current_depth in range(1, safe_depth + 1):
+            next_layer: Dict[str, float] = {}
+            for u, u_conf in current_layer.items():
+                for edge in adj.get(u, []):
+                    tgt = edge["target"]
+                    pred = edge["predicate"]
+                    conf = edge["confidence"]
 
-                if tgt in path_visited:
-                    continue  # Unikaj cykli na bieżącej ścieżce
+                    if tgt == start_node or tgt == u:
+                        continue
 
-                edge_key = (current_node, pred, tgt)
-                if edge_key not in seen_edges:
-                    seen_edges.add(edge_key)
-                    collected_edges.append(CausalEdge(
-                        source=current_node,
-                        predicate=pred,
-                        target=tgt,
-                        confidence=conf,
-                        impact_type="critical_dependency" if pred in self.critical_predicates else "general_dependency",
-                    ))
+                    edge_key = (u, pred, tgt)
+                    if edge_key not in seen_edges:
+                        seen_edges.add(edge_key)
+                        collected_edges.append(CausalEdge(
+                            source=u,
+                            predicate=pred,
+                            target=tgt,
+                            confidence=conf,
+                            impact_type="critical_dependency" if pred in self.critical_predicates else "general_dependency",
+                        ))
 
-                hop_depth = current_depth
-                if hop_depth > max_reached_depth:
-                    max_reached_depth = hop_depth
+                    max_reached_depth = max(max_reached_depth, current_depth)
+                    trans_conf = u_conf * conf
+                    step_impact = trans_conf * (safe_decay ** current_depth)
 
-                cum_conf = current_conf * conf
-                step_impact = cum_conf * (safe_decay ** hop_depth)
+                    if tgt not in node_stats:
+                        node_stats[tgt] = {
+                            "impact_score": 0.0,
+                            "path_length": current_depth,
+                            "cumulative_confidence": min(1.0, trans_conf),
+                        }
+                    else:
+                        node_stats[tgt]["path_length"] = min(node_stats[tgt]["path_length"], current_depth)
+                        node_stats[tgt]["cumulative_confidence"] = min(1.0, max(node_stats[tgt]["cumulative_confidence"], trans_conf))
 
-                if tgt not in node_stats:
-                    node_stats[tgt] = {
-                        "impact_score": 0.0,
-                        "path_length": hop_depth,
-                        "cumulative_confidence": cum_conf,
-                    }
-                else:
-                    node_stats[tgt]["path_length"] = min(node_stats[tgt]["path_length"], hop_depth)
-                    node_stats[tgt]["cumulative_confidence"] = max(node_stats[tgt]["cumulative_confidence"], cum_conf)
+                    node_stats[tgt]["impact_score"] += step_impact
+                    next_layer[tgt] = min(1.0, next_layer.get(tgt, 0.0) + trans_conf)
 
-                node_stats[tgt]["impact_score"] += step_impact
-
-                traverse(tgt, cum_conf, current_depth + 1, path_visited | {tgt})
-
-        traverse(start_node, 1.0, 1, {start_node})
+            if not next_layer:
+                break
+            current_layer = next_layer
 
         diffusion_nodes = self._build_diffusion_nodes(node_stats)
         total_impact = round(sum(n.impact_score for n in diffusion_nodes), 6)
@@ -266,8 +309,8 @@ class RetroCausalEngine:
 
         for candidate in all_reachable:
             reachable_without_c = get_reachable(node_id, excluded_node=candidate)
-            # Węzły dotknięte to te z all_reachable (poza samym candidate), które tracą osiągalność
-            affected = (all_reachable - {candidate}) - reachable_without_c
+            # Węzły dotknięte to te z all_reachable, które tracą osiągalność przy awarii candidate (w tym sam candidate)
+            affected = all_reachable - reachable_without_c
             severity = len(affected) / total_reachable
 
             if severity >= 0.5:
@@ -281,91 +324,6 @@ class RetroCausalEngine:
         cpof_nodes.sort(key=lambda x: x.severity, reverse=True)
         return cpof_nodes
 
-    async def multi_hop_cypher_query(
-        self,
-        source: str,
-        target: str,
-        max_hops: int = 5,
-        exclude_cycles: bool = True,
-    ) -> List[CausalPath]:
-        """
-        Wykrywa wieloskokowe ścieżki przyczynowe między source a target przy użyciu zapytań grafowych.
-        """
-        raw_paths = []
-        if hasattr(self.graph, "execute_multi_hop_cypher"):
-            res = self.graph.execute_multi_hop_cypher(source, target, max_hops=max_hops)
-            if hasattr(res, "__await__"):
-                raw_paths = await res
-            else:
-                raw_paths = res
-        elif isinstance(self.graph, dict):
-            # Fallback dla mocków dict
-            def find_paths(curr: str, tgt: str, current_path: List[Dict[str, Any]], visited: Set[str], hops: int):
-                if hops > max_hops:
-                    return
-                for edge in self.graph.get(curr, []):
-                    nxt = edge["target"] if isinstance(edge, dict) else edge
-                    pred = edge.get("predicate", "leads_to") if isinstance(edge, dict) else "leads_to"
-                    conf = edge.get("confidence", 1.0) if isinstance(edge, dict) else 1.0
-                    edge_dict = {"source": curr, "predicate": pred, "target": nxt, "confidence": conf}
-                    if nxt == tgt:
-                        raw_paths.append(current_path + [edge_dict])
-                    elif nxt not in visited or not exclude_cycles:
-                        find_paths(nxt, tgt, current_path + [edge_dict], visited | {nxt}, hops + 1)
-            find_paths(source, target, [], {source}, 1)
-
-        causal_paths: List[CausalPath] = []
-        for raw in raw_paths:
-            if isinstance(raw, dict) and "edges" in raw:
-                edges_data = raw["edges"]
-            elif isinstance(raw, list):
-                edges_data = raw
-            else:
-                continue
-
-            steps: List[CausalEdge] = []
-            nodes_in_path = [source]
-            cum_conf = 1.0
-            has_cycle = False
-
-            for ed in edges_data:
-                s = ed.get("source", ed.get("from", ""))
-                t = ed.get("target", ed.get("to", ""))
-                p = ed.get("predicate", "leads_to")
-                c = float(ed.get("confidence", 1.0))
-
-                if t in nodes_in_path:
-                    has_cycle = True
-                nodes_in_path.append(t)
-                cum_conf *= c
-
-                steps.append(CausalEdge(
-                    source=s,
-                    predicate=p,
-                    target=t,
-                    confidence=c,
-                    impact_type="critical_dependency" if p in self.CRITICAL_PREDICATES else "general_dependency",
-                ))
-
-            if exclude_cycles and has_cycle:
-                continue
-
-            if not steps or steps[-1].target != target:
-                continue
-
-            cum_conf = round(cum_conf, 4)
-            causal_paths.append(CausalPath(
-                source_entity=source,
-                simulated_action="multi_hop_query",
-                steps=steps,
-                affected_target=target,
-                cumulative_confidence=cum_conf,
-                risk_level="HIGH" if cum_conf >= 0.7 else "MODERATE",
-                description=f"Multi-hop causal path from '{source}' to '{target}' ({len(steps)} hops)",
-            ))
-
-        causal_paths.sort(key=lambda p: p.cumulative_confidence, reverse=True)
-        return causal_paths
 
     async def causal_what_if(
         self,
@@ -395,6 +353,8 @@ class RetroCausalEngine:
 
         # Opcjonalna ekstrapolacja z L1 JEPA
         jepa_divergence = self._compute_jepa_divergence(action, entity)
+        cpof_list = await self.detect_cpof(entity)
+        cpof_map = {n.node_id: n.severity for n in cpof_list}
 
         seen_path_signatures: Set[str] = set()
 
@@ -424,8 +384,15 @@ class RetroCausalEngine:
                 new_steps = current_steps + [step]
                 new_conf = round(current_conf * conf, 4)
 
-                # Ocena poziomu ryzyka ścieżki
-                risk = self._assess_path_risk(action, new_steps, tgt, new_conf)
+                # Ocena poziomu ryzyka ścieżki (V154 Filar II: JEPA-CPoF)
+                risk = self._assess_path_risk(
+                    action,
+                    new_steps,
+                    tgt,
+                    new_conf,
+                    jepa_divergence=jepa_divergence,
+                    cpof_map=cpof_map,
+                )
 
                 desc = f"Akcja '{action}' na '{entity}' wpływa na '{tgt}' przez relację '{pred}' (ufność: {new_conf:.2f})"
                 desc = EMAIL_PATTERN.sub("[REDACTED_PII]", desc)
@@ -455,66 +422,45 @@ class RetroCausalEngine:
         paths.sort(key=lambda p: (p.risk_level == "CRITICAL", p.risk_level == "HIGH", p.cumulative_confidence), reverse=True)
         return paths
 
-    async def evaluate_what_if(
-        self,
-        entity: str,
-        action: str,
-        depth: int = 2,
-    ) -> WhatIfResult:
-        """Kompleksowa ocena bezpieczeństwa i skutków akcji."""
-        paths = await self.causal_what_if(entity, action, depth=depth)
-
-        highest_risk = None
-        safety_score = 1.0
-
-        if paths:
-            highest_risk = paths[0].affected_target
-            # Obliczenie współczynnika bezpieczeństwa (im więcej ścieżek krytycznych, tym niższe safety)
-            risk_penalty = sum(
-                0.3 if p.risk_level == "CRITICAL" else 0.15 if p.risk_level == "HIGH" else 0.05
-                for p in paths
-            )
-            safety_score = max(0.0, round(1.0 - min(1.0, risk_penalty), 2))
-
-        return WhatIfResult(
-            source_entity=entity,
-            simulated_action=action,
-            paths=paths,
-            highest_risk_target=highest_risk,
-            overall_safety_score=safety_score,
-            jepa_extrapolation_used=self.latent is not None,
-        )
 
     async def _fetch_subgraph(self, entity: str, max_depth: int = 2) -> Dict[str, Any]:
         """Pobiera podgraf z obiektu grafu."""
-        if hasattr(self.graph, "get_subgraph_relations"):
-            return await self.graph.get_subgraph_relations([entity], max_depth=max_depth)
-        elif hasattr(self.graph, "get_subgraph_for_entities"):
-            return await self.graph.get_subgraph_for_entities([entity])
-        elif hasattr(self.graph, "nx_graph"):
+        if inspect.iscoroutinefunction(getattr(self.graph, "get_subgraph_relations", None)):
+            res = await self.graph.get_subgraph_relations([entity], max_depth=max_depth)
+            return res if isinstance(res, dict) else {"relations": []}
+        elif inspect.iscoroutinefunction(getattr(self.graph, "get_subgraph_for_entities", None)):
+            res = await self.graph.get_subgraph_for_entities([entity])
+            return res if isinstance(res, dict) else {"relations": []}
+        elif hasattr(self.graph, "nx_graph") and hasattr(self.graph.nx_graph, "edges"):
+            raw_edges = self.graph.nx_graph.edges(data=True)
+            if not isinstance(raw_edges, (list, tuple, set)) and not hasattr(raw_edges, "__iter__"):
+                return {"relations": []}
             edges = []
-            for u, v, data in self.graph.nx_graph.edges(data=True):
-                edges.append({
-                    "subject": u,
-                    "predicate": data.get("predicate", "relates_to"),
-                    "object": v,
-                    "confidence": data.get("confidence", 1.0),
-                })
+            for item in raw_edges:
+                if isinstance(item, tuple) and len(item) == 3 and isinstance(item[2], dict):
+                    u, v, data = item
+                    edges.append({
+                        "subject": u,
+                        "predicate": data.get("predicate", "relates_to"),
+                        "object": v,
+                        "confidence": data.get("confidence", 1.0),
+                    })
             return {"relations": edges, "active_roots": [entity]}
         elif isinstance(self.graph, dict) or hasattr(self.graph, "adj"):
             edges = []
             adj = self.graph if isinstance(self.graph, dict) else getattr(self.graph, "adj", {})
-            for u, nbrs in adj.items():
-                for nbr in nbrs:
-                    if isinstance(nbr, dict):
-                        edges.append({
-                            "subject": u,
-                            "predicate": nbr.get("predicate", "leads_to"),
-                            "object": nbr.get("target", ""),
-                            "confidence": nbr.get("confidence", 1.0),
-                        })
-                    elif isinstance(nbr, str):
-                        edges.append({"subject": u, "predicate": "leads_to", "object": nbr, "confidence": 1.0})
+            if isinstance(adj, dict):
+                for u, nbrs in adj.items():
+                    for nbr in nbrs:
+                        if isinstance(nbr, dict):
+                            edges.append({
+                                "subject": u,
+                                "predicate": nbr.get("predicate", "leads_to"),
+                                "object": nbr.get("target", ""),
+                                "confidence": nbr.get("confidence", 1.0),
+                            })
+                        elif isinstance(nbr, str):
+                            edges.append({"subject": u, "predicate": "leads_to", "object": nbr, "confidence": 1.0})
             return {"relations": edges, "active_roots": [entity]}
         return {"relations": []}
 
@@ -524,27 +470,37 @@ class RetroCausalEngine:
         annealer: Optional[Any] = None,
         target_entity: Optional[str] = None,
         max_depth: int = 2,
+        anneal_max_iter: Optional[int] = None,
     ) -> Dict[str, Any]:
         """
         Wektor V37: Autonomiczna rekalibracja wag grafu przyczynowego Kùzu przez wyżarzanie.
         
         Pobiera podgraf wokół target_entity, tworzy obiekty CausalEdge, optymalizuje ich wagi
         za pomocą CausalAnnealer i aktualizuje zoptymalizowane pewności z powrotem w grafie.
+
+        V68 (ARCH-003): opcjonalny `anneal_max_iter` ogranicza liczbę iteracji
+        wyżarzania (faza cyklu snu używa małego limitu, np. 100). Domyślnie None
+        => zachowane dotychczasowe zachowanie RPC 'anneal' (limit domyślny
+        CausalAnnealer.run, 500). Zapis korygowanych pewnością krawędzi idzie
+        WYŁĄCZNIE przez EpistemicWritePath.commit_relation (choke point V56) —
+        żadnego bezpośredniego graph.add_relation tutaj ani u konsumentów.
         """
         if self.graph is None:
             return {"status": "no_graph", "updated_edges": 0}
 
         subgraph_data = await self._fetch_subgraph(target_entity or "Root", max_depth=max_depth)
-        relations = subgraph_data.get("relations", [])
+        relations = subgraph_data.get("relations", []) if isinstance(subgraph_data, dict) else []
         if not relations:
             # If specific target entity was requested and has no direct edges, do not recalibrate the entire graph
             if target_entity and target_entity != "Root":
                 logger.info("[ANNEAL] Target entity '%s' has no causal subgraphs; skipping anneal.", target_entity)
                 return {"status": "no_relations", "updated_edges": 0}
             # Fallback to any graph relations if generic root requested
-            if hasattr(self.graph, "nx_graph") and self.graph.nx_graph.number_of_edges() > 0:
+            nx_g = getattr(self.graph, "nx_graph", None)
+            num_edges = nx_g.number_of_edges() if nx_g is not None and hasattr(nx_g, "number_of_edges") else 0
+            if isinstance(num_edges, int) and num_edges > 0:
                 edges_fb = []
-                for u, v, data in self.graph.nx_graph.edges(data=True):
+                for u, v, data in nx_g.edges(data=True):
                     edges_fb.append({
                         "subject": u,
                         "predicate": data.get("predicate", "relates_to"),
@@ -580,7 +536,10 @@ class RetroCausalEngine:
             from atlas_memory.causal.annealer import CausalAnnealer
             annealer = CausalAnnealer(energy_module=energy_module)
 
-        anneal_res = await annealer.run(edges)
+        anneal_res = await annealer.run(
+            edges,
+            max_iter=anneal_max_iter if anneal_max_iter is not None else 500,
+        )
 
         from atlas_memory.cognitive.write_path import EpistemicWritePath
 

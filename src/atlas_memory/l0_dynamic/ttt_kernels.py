@@ -90,9 +90,14 @@ def numba_ttt_adapt_step(
 
     grad_w = _numba_matmul_2d(x.T, grad_z)
 
-    # 5. Aktualizacja in-place z weight decay
+    # 5. Aktualizacja in-place z weight decay (zarówno w_ttt jak i w_recon)
     for r in range(w_ttt.shape[0]):
         for c in range(w_ttt.shape[1]):
             w_ttt[r, c] -= lr * (grad_w[r, c] + weight_decay * w_ttt[r, c])
+
+    grad_recon = _numba_matmul_2d(h.T, diff)
+    for r in range(w_recon.shape[0]):
+        for c in range(w_recon.shape[1]):
+            w_recon[r, c] -= lr * (grad_recon[r, c] + weight_decay * w_recon[r, c])
 
     return loss

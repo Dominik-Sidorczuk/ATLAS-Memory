@@ -278,7 +278,8 @@ async def test_daemon_session_end_dispatch():
         "turn_count": 3,
         "trigger_sleep": False,
     })
-    assert res["status"] == "ok"
+    assert res["status"] == "noop"
+    assert res["reason"] == "no_engine"  # daemon w/o engine => no_engine reason
     assert res["session_id"] == "contract_sess_42"
     assert res["turn_count"] == 3
 

@@ -134,21 +134,22 @@ class LoopDoctor:
             return True
 
     def check_baseline_json_integrity(self) -> bool:
-        """Verify baseline JSON files are valid and non-empty (Harness-Foundry rule)."""
-        if not BASELINES_DIR.exists():
+        """Verify baseline/calibration JSON files are valid and non-empty (Harness-Foundry / ADR-019 rule)."""
+        target_dir = BASELINES_DIR if BASELINES_DIR.exists() else (self.root / "docs" / "calib")
+        if not target_dir.exists():
             if self.public_mode:
                 self.warnings.append("docs/baselines/ not in public repo — private benchmarks stay local")
                 return True
-            self.issues.append("docs/baselines/ directory is missing")
+            self.issues.append("Neither docs/baselines/ nor docs/calib/ directory exists")
             self.score_points -= 25
             return False
 
-        json_files = list(BASELINES_DIR.glob("*.json"))
+        json_files = list(target_dir.glob("*.json"))
         if not json_files:
             if self.public_mode:
-                self.warnings.append("docs/baselines/ has no JSONs — private benchmarks stay local")
+                self.warnings.append(f"{target_dir.name}/ has no JSONs — private benchmarks stay local")
                 return True
-            self.issues.append("Zero baseline JSON files found in docs/baselines/")
+            self.issues.append(f"Zero baseline JSON files found in {target_dir.relative_to(self.root)}/")
             self.score_points -= 25
             return False
 
@@ -318,7 +319,6 @@ class LoopDoctor:
         print(" - Retrieval Policy Gate:    ~95.0% noise rejection (0 token overhead)")
         print(" - Token Budget Governor:    Hard ceiling <= 1,500 tokens per recall")
         print(" - PrefixCacheGuard:         ~90% KV Cache Hit-Rate on deterministic prefix")
-        print(" - RaBitQ Vector Engine:     32x memory compression (48B per 384-dim vector)")
         print("=" * 80)
 
 

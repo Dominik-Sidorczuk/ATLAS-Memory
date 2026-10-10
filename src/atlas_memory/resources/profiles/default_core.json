@@ -1,0 +1,48 @@
+{
+  "profile_name": "default_core",
+  "version": "1.0.0",
+  "description": "Universal AGI Core Profile without domain-specific vocabularies",
+  "custom_predicates": {
+    "depends_on": {
+      "transitive": true,
+      "symmetry": false
+    },
+    "requires": {
+      "transitive": false,
+      "criticality": "HIGH"
+    },
+    "specifies": {
+      "transitive": false
+    },
+    "leads_to": {
+      "causal": true
+    },
+    "requires_condition": {
+      "criticality": "MODERATE"
+    }
+  },
+  "structural_rules": [
+    {
+      "pattern": "(?:protocol|protokół)\\s+([A-Za-z0-9_-]{3,})",
+      "parent_template": "Protokół",
+      "rel_label": "specifies"
+    },
+    {
+      "pattern": "(?:requires|wymaga)\\s+([A-Za-z0-9_-]{3,})",
+      "parent_template": "{subject}",
+      "rel_label": "requires"
+    },
+    {
+      "pattern": "(?:depends on|zależy od)\\s+([A-Za-z0-9_-]{3,})",
+      "parent_template": "{subject}",
+      "rel_label": "depends_on"
+    }
+  ],
+  "entities": [],
+  "critical_keywords": [
+    "crash", "failure", "fatal", "broken", "corrupt", "leak", "deadlock",
+    "hazard", "danger", "exceed", "limit", "truncate", "truncate_table",
+    "drop_table", "delete_all", "database", "flush_all", "destroy"
+  ]
+}
+

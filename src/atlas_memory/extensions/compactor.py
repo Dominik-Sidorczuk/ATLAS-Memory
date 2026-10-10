@@ -5,7 +5,7 @@ from typing import Any, Dict, List, Optional
 
 from pydantic import BaseModel, Field
 
-from atlas_memory.models import EpistemicSource, MemoryRecord
+from atlas_memory.core.models import EpistemicSource, MemoryRecord
 
 
 class CompactionLevel(BaseModel):
@@ -65,16 +65,18 @@ class ContextCompactor:
             role = turn["role"].upper()
             content = turn["content"].strip()
             lines.append(f"[{role}]: {content}")
+            meta = turn.get("metadata", {})
 
-            # Heurystyczna ekstrakcja faktów z wypowiedzi konfiguracyjnych/decyzyjnych
-            if any(k in content.lower() for k in ["zmień", "ustaw", "serwer to", "używaj", "status:", "port:"]):
+            # Ekstrakcja kluczowych faktów wyłącznie po obiektywnej wadze poznawczej (importance_score >= 0.80)
+            importance = float(meta.get("importance_score", 0.8 if meta.get("priority") == "high" or role == "USER" else 0.5))
+            if importance >= 0.80:
                 extracted_facts.append(MemoryRecord(
                     subject=f"episode_{episode_id}",
                     predicate="contains_decision",
                     object=content[:120],
                     confidence=0.90,
                     source_type=EpistemicSource.USER_EXPLICIT if role == "USER" else EpistemicSource.AGENT_INFERENCE,
-                    importance_score=0.8,
+                    importance_score=importance,
                 ))
 
         compressed_summary = (

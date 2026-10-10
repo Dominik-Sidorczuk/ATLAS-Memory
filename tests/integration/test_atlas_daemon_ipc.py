@@ -11,8 +11,8 @@ from typing import Any, Dict, List
 import pytest
 
 from atlas_memory.hermes.atlas_provider import AtlasMemoryProvider
+from atlas_memory.ipc.uds_client import AtlasDaemonClient
 from atlas_memory.server.atlas_daemon import AtlasDaemon
-from atlas_memory.server.client import AtlasDaemonClient
 
 
 class DummyOrchestrator:
@@ -28,18 +28,24 @@ class DummyOrchestrator:
         return [f"Fact: {user_msg} -> {agent_response}"]
 
 
-class DummyGraphClient:
-    """Mock causal graph client for what_if testing."""
+class DummyCausalEngine:
+    """Causal engine stub for what_if IPC testing."""
 
-    def what_if(self, action: str) -> Dict[str, Any]:
-        return {"action": action, "nodes": ["N1", "N2"], "confidence": 0.88}
+    async def causal_what_if(self, entity: str, action: str, depth: int = 2) -> List[Dict[str, Any]]:
+        return [{
+            "source_entity": entity,
+            "simulated_action": action,
+            "affected_target": "target_cache",
+            "cumulative_confidence": 0.88,
+            "confidence": 0.88,
+        }]
 
 
 @pytest.mark.asyncio
-async def test_daemon_ping(tmp_path: Path) -> None:
+async def test_daemon_ping(tmp_path: Path, uds_dir: Path) -> None:
     """Test 1: Start daemon on temp socket, send ping, receive status ok."""
-    sock_path = tmp_path / "atlas_test.sock"
-    pid_path = tmp_path / "atlas_test.pid"
+    sock_path = uds_dir / "atlas_test.sock"
+    pid_path = uds_dir / "atlas_test.pid"
 
     daemon = AtlasDaemon(socket_path=sock_path, pid_path=pid_path)
     await daemon.start()
@@ -53,10 +59,10 @@ async def test_daemon_ping(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_daemon_prefetch(tmp_path: Path) -> None:
+async def test_daemon_prefetch(tmp_path: Path, uds_dir: Path) -> None:
     """Test 2: Daemon with mock orchestrator responds to prefetch RPC."""
-    sock_path = tmp_path / "atlas_test.sock"
-    pid_path = tmp_path / "atlas_test.pid"
+    sock_path = uds_dir / "atlas_test.sock"
+    pid_path = uds_dir / "atlas_test.pid"
 
     orchestrator = DummyOrchestrator()
     daemon = AtlasDaemon(socket_path=sock_path, pid_path=pid_path, orchestrator=orchestrator)
@@ -74,17 +80,17 @@ async def test_daemon_prefetch(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_daemon_what_if(tmp_path: Path) -> None:
-    """Test 3: Daemon with mock graph client handles what_if RPC query."""
-    sock_path = tmp_path / "atlas_test.sock"
-    pid_path = tmp_path / "atlas_test.pid"
+async def test_daemon_what_if(tmp_path: Path, uds_dir: Path) -> None:
+    """Test 3: Daemon with causal engine handles what_if RPC query."""
+    sock_path = uds_dir / "atlas_test.sock"
+    pid_path = uds_dir / "atlas_test.pid"
 
-    graph = DummyGraphClient()
-    daemon = AtlasDaemon(socket_path=sock_path, pid_path=pid_path, graph_client=graph)
+    engine = DummyCausalEngine()
+    daemon = AtlasDaemon(socket_path=sock_path, pid_path=pid_path, causal_engine=engine)
     await daemon.start()
     try:
         client = AtlasDaemonClient(socket_path=sock_path)
-        resp = await client.call("what_if", {"action": "delete_cache"})
+        resp = await client.call("what_if", {"action": "delete_cache", "entity": "cache_svc"})
         assert isinstance(resp, dict)
         assert resp["action"] == "delete_cache"
         assert resp["causal_path"]["confidence"] == 0.88
@@ -118,10 +124,10 @@ async def test_client_fallback_when_socket_missing(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_client_reconnect(tmp_path: Path) -> None:
+async def test_client_reconnect(tmp_path: Path, uds_dir: Path) -> None:
     """Test 5: Client reconnects when daemon restarts."""
-    sock_path = tmp_path / "atlas_test.sock"
-    pid_path = tmp_path / "atlas_test.pid"
+    sock_path = uds_dir / "atlas_test.sock"
+    pid_path = uds_dir / "atlas_test.pid"
 
     daemon = AtlasDaemon(socket_path=sock_path, pid_path=pid_path)
     await daemon.start()
@@ -146,10 +152,10 @@ async def test_client_reconnect(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_concurrent_requests(tmp_path: Path) -> None:
+async def test_concurrent_requests(tmp_path: Path, uds_dir: Path) -> None:
     """Test 6: Multiple concurrent requests over UDS client succeed without race conditions."""
-    sock_path = tmp_path / "atlas_test.sock"
-    pid_path = tmp_path / "atlas_test.pid"
+    sock_path = uds_dir / "atlas_test.sock"
+    pid_path = uds_dir / "atlas_test.pid"
 
     orchestrator = DummyOrchestrator()
     daemon = AtlasDaemon(socket_path=sock_path, pid_path=pid_path, orchestrator=orchestrator)
@@ -171,10 +177,10 @@ async def test_concurrent_requests(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_pid_file_prevents_multi_instance(tmp_path: Path) -> None:
+async def test_pid_file_prevents_multi_instance(tmp_path: Path, uds_dir: Path) -> None:
     """Test 7: Attempting to start daemon with active PID file raises RuntimeError."""
-    sock_path = tmp_path / "atlas_test.sock"
-    pid_path = tmp_path / "atlas_test.pid"
+    sock_path = uds_dir / "atlas_test.sock"
+    pid_path = uds_dir / "atlas_test.pid"
 
     daemon1 = AtlasDaemon(socket_path=sock_path, pid_path=pid_path)
     await daemon1.start()
@@ -187,10 +193,10 @@ async def test_pid_file_prevents_multi_instance(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_daemon_notifications_send_no_response(tmp_path: Path) -> None:
+async def test_daemon_notifications_send_no_response(tmp_path: Path, uds_dir: Path) -> None:
     """Test 8: Notification (no 'id' or id=None) executes handler without sending response."""
-    sock_path = tmp_path / "atlas_test.sock"
-    pid_path = tmp_path / "atlas_test.pid"
+    sock_path = uds_dir / "atlas_test.sock"
+    pid_path = uds_dir / "atlas_test.pid"
 
     daemon = AtlasDaemon(socket_path=sock_path, pid_path=pid_path)
     await daemon.start()
@@ -236,10 +242,10 @@ async def test_daemon_notifications_send_no_response(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_daemon_batch_requests(tmp_path: Path) -> None:
+async def test_daemon_batch_requests(tmp_path: Path, uds_dir: Path) -> None:
     """Test 9: Batch requests handling: empty list, valid batches, mixed with notifications."""
-    sock_path = tmp_path / "atlas_test.sock"
-    pid_path = tmp_path / "atlas_test.pid"
+    sock_path = uds_dir / "atlas_test.sock"
+    pid_path = uds_dir / "atlas_test.pid"
 
     daemon = AtlasDaemon(socket_path=sock_path, pid_path=pid_path)
     await daemon.start()
@@ -312,10 +318,10 @@ async def test_daemon_batch_requests(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_daemon_verify_audit_log_rpc(tmp_path: Path) -> None:
+async def test_daemon_verify_audit_log_rpc(tmp_path: Path, uds_dir: Path) -> None:
     """Test 10: verify_audit_log RPC method checks audit log and returns expected dict."""
-    sock_path = tmp_path / "atlas_test.sock"
-    pid_path = tmp_path / "atlas_test.pid"
+    sock_path = uds_dir / "atlas_test.sock"
+    pid_path = uds_dir / "atlas_test.pid"
 
     class MockKV:
         def __init__(self) -> None:
@@ -346,10 +352,10 @@ async def test_daemon_verify_audit_log_rpc(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_daemon_sync_turn_status_ok(tmp_path: Path) -> None:
+async def test_daemon_sync_turn_status_ok(tmp_path: Path, uds_dir: Path) -> None:
     """Test 11: sync_turn RPC returns status: ok in response dict."""
-    sock_path = tmp_path / "atlas_test.sock"
-    pid_path = tmp_path / "atlas_test.pid"
+    sock_path = uds_dir / "atlas_test.sock"
+    pid_path = uds_dir / "atlas_test.pid"
 
     daemon = AtlasDaemon(socket_path=sock_path, pid_path=pid_path)
     await daemon.start()
@@ -371,16 +377,16 @@ async def test_daemon_sync_turn_status_ok(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_daemon_get_all_sync_used_in_prefetch_and_stats(tmp_path: Path) -> None:
+async def test_daemon_get_all_sync_used_in_prefetch_and_stats(tmp_path: Path, uds_dir: Path) -> None:
     """Test 12: Verify get_all_sync is invoked for prefetch and get_stats."""
-    sock_path = tmp_path / "atlas_test.sock"
-    pid_path = tmp_path / "atlas_test.pid"
+    sock_path = uds_dir / "atlas_test.sock"
+    pid_path = uds_dir / "atlas_test.pid"
 
     class SpyKV:
         def __init__(self) -> None:
             self.get_all_sync_called = 0
 
-        def get_all_sync(self) -> Dict[str, Any]:
+        def get_all_sync(self, *args: Any, **kwargs: Any) -> Dict[str, Any]:
             self.get_all_sync_called += 1
             return {
                 "pref_key": {
@@ -441,7 +447,7 @@ def test_h5_uds_e2e_prefetch_continuation():
     H5 UDS E2E test: verifies atlas_recall tool handler executes prefetch via Unix Domain Socket.
     Skips cleanly with pytest.skip if daemon socket does not exist.
     """
-    from atlas_memory.server.models import DEFAULT_SOCKET_PATH
+    from atlas_memory.ipc.wire_models import DEFAULT_SOCKET_PATH
     sock_path = Path(DEFAULT_SOCKET_PATH)
     if not sock_path.exists():
         pytest.skip(f"ATLAS daemon UDS socket not found at {sock_path}")
@@ -462,10 +468,10 @@ def test_h5_uds_e2e_prefetch_continuation():
 
 
 @pytest.mark.asyncio
-async def test_live_daemon_uds_trajectory_e2e(tmp_path: Path):
+async def test_live_daemon_uds_trajectory_e2e(tmp_path: Path, uds_dir: Path):
     """Uruchamia daemona UDS, wykonuje 3 wywołania RPC i weryfikuje zliczanie trajektorii w get_stats."""
-    sock_path = tmp_path / "test_v51.sock"
-    pid_path = tmp_path / "test_v51.pid"
+    sock_path = uds_dir / "test_v51.sock"
+    pid_path = uds_dir / "test_v51.pid"
     atlas_dir = tmp_path / "atlas_vault"
 
     daemon = AtlasDaemon.create_default(

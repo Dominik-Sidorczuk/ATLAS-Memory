@@ -1,5 +1,5 @@
 name: atlas
-version: 2.0.0
+version: 3.0.0
 description: "ATLAS Cognitive Memory Sidecar for Hermes — Zero-GIL Python 3.14 Micro-Daemon with Verified KV Ledger, Kùzu Graph, RaBitQ Vector Store, Retro-Causal What-If, and Active Sensing."
 author: Dominik Sidorczuk
 provides_tools:

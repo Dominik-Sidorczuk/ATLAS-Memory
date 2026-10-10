@@ -4,14 +4,14 @@ build-backend = "hatchling.build"
 
 [project]
 name = "atlas-memory"
-version = "2.0.0"
+version = "3.0.0"
 description = "ATLAS Memory — 4-Layer Memory Architecture (TTT + JEPA + Hybrid Knowledge + Sleep Consolidation) with CRDT Sync, SIMD Quantization, and Autonomous Skill Compilation"
 readme = "README.md"
 requires-python = ">=3.11"
 authors = [
     { name = "Dominik Sidorczuk" }
 ]
-keywords = ["memory", "crdt", "agent", "llm", "mlops", "quantization", "skill-compiler"]
+keywords = ["memory", "crdt", "agent", "llm", "mlops", "skill-compiler"]
 classifiers = [
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
@@ -36,11 +36,18 @@ dependencies = [
     "fastembed>=0.3.0",          # Błyskawiczne lokalne embeddingi (ONNX Runtime)
     "kuzu>=0.4.0",               # Wbudowana, dyskowa baza grafowa (Cypher query language)
     "networkx>=3.2.0",           # Do analizy topologicznej podgrafów w pamięci
+    "spacy>=3.8.0",              # W2 OpenIE / morfologia PL+EN (POS, lematyzacja, zależności, NER — zero-torch)
+    "python-igraph>=1.0.0",      # W4 Natywny silnik C Personalized PageRank (HippoRAG 2)
+
+    # Podstawa Pamięci & Hot-Path Storage Backend: Mnemosyne Core & Hermes Bridge
+    "mnemosyne-memory>=4.0.0b4", # Mnemosyne core (BEAM: SQLite + sqlite-vec + FTS5)
+    "mnemosyne-hermes>=0.7.4",   # Hermes MemoryProvider bridge (in-process hot-path)
 ]
 
 [project.optional-dependencies]
 hermes = [
-    "mnemosyne-hermes>=0.5.0",  # Opcjonalne: Hermes Agent native MemoryProvider backend
+    "mnemosyne-memory>=4.0.0b4",
+    "mnemosyne-hermes>=0.7.4",
 ]
 peft = [
     "peft>=0.10.0",              # Opcjonalne: Zarządzanie mikro-adapterami LoRA (Weight Baking)
@@ -63,6 +70,9 @@ all = [
 
 
 
+[project.scripts]
+atlas-daemon = "atlas_memory.server.atlas_daemon:main"
+
 [tool.hatch.build.targets.wheel]
 packages = ["src/atlas_memory"]
 
@@ -71,9 +81,9 @@ asyncio_mode = "auto"
 testpaths = ["tests"]
 pythonpath = ["src"]
 markers = [
-    "dead_module: tests for dormant ADR-001 modules (TTT, BFT, dedup)",
+    "benchmark: performance benchmarks",
 ]
-addopts = "-m 'not dead_module'"
+addopts = "-m 'not benchmark'"
 
 [tool.ruff]
 line-length = 160
@@ -94,12 +104,25 @@ platforms = ["linux-64"]
 
 [tool.pixi.tasks]
 test = "pytest tests/ -v"
-benchmark = "pytest tests/benchmark/ -v"
+benchmark = "pytest tests/benchmark/ -m benchmark -v"
 doctor = "python scripts/loop_doctor.py"
 "doctor:ci" = "python scripts/loop_doctor.py --public"
 "doctor:fix" = "bash scripts/doctor_fix.sh"
 audit = "python scripts/loop_doctor.py"
 cost = "python scripts/loop_doctor.py --cost"
+invariants = "python scripts/atlas_health_invariants.py"
+dedup = "python scripts/atlas_dedup_kv.py --dry-run"
+"backup:audit" = "python scripts/atlas_backup_audit.py"
+cleanup = "python scripts/atlas_memory_cleanup.py"
+profile = "python scripts/profile_hot_paths.py"
+calibrate = "python scripts/build_retrieval_calibration.py"
+"calibration:build" = "python scripts/build_retrieval_calibration.py"
+"benchmark:beam" = "python scripts/run_beam_benchmark.py"
+"benchmark:head2head" = "python scripts/run_head_to_head_benchmark.py"
+"qdrant:rebuild" = "python scripts/rebuild_qdrant_68m.py"
+"integration:omniroute" = "python scripts/integration_real_omniroute.py"
+"memory-map" = "python scripts/atlas_memory_map_v3.py"
+"memory-map:v3" = "python scripts/atlas_memory_map_v3.py"
 
 
 
@@ -124,3 +147,5 @@ qdrant-client = ">=1.9.0"
 fastembed = ">=0.3.0"
 kuzu = ">=0.4.0"
 peft = ">=0.10.0"
+spacy = ">=3.8.0"
+python-igraph = ">=1.0.0"

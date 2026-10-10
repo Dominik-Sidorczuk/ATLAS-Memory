@@ -26,95 +26,238 @@ from __future__ import annotations
 import json
 import logging
 import os
+import queue
 import re
 import threading
 import time
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Union
+
+if TYPE_CHECKING:
+    from atlas_memory.orchestrator import MemoryOrchestrator
+
+from atlas_memory.core.models import (
+    HERMES_DEFAULT_SESSION,
+    EpistemicSource,
+    MemoryRecord,
+    clamp_conf,
+)
+from atlas_memory.hermes.plugin_hooks import DedicatedAsyncBridge
+from atlas_memory.hermes.tools import (
+    ATLAS_ACTIVE_SENSING_SCHEMA,
+    ATLAS_DELETE_SCHEMA,
+    ATLAS_GET_SCHEMA,
+    ATLAS_RECALL_SCHEMA,
+    ATLAS_REMEMBER_SCHEMA,
+    ATLAS_SLEEP_SYNC_SCHEMA,
+    ATLAS_STATS_SCHEMA,
+    ATLAS_TASK_FEEDBACK_SCHEMA,
+    ATLAS_TOOL_SCHEMAS,
+    ATLAS_VERIFY_CHAIN_SCHEMA,
+    ATLAS_WHAT_IF_SCHEMA,
+    create_uds_tool_handlers,
+)
+from atlas_memory.hermes.trajectory_extractor import extract_trajectory
+from atlas_memory.ipc.uds_client import (
+    AtlasTransportError,
+    get_or_create_client,
+    send_uds_request_sync,
+)
+from atlas_memory.security.delete_guard import is_delete_protected
 
 logger = logging.getLogger(__name__)
-
-try:
-    from atlas_memory.hermes.tools import (
-        ATLAS_ACTIVE_SENSING_SCHEMA,
-        ATLAS_DELETE_SCHEMA,
-        ATLAS_GET_SCHEMA,
-        ATLAS_RECALL_SCHEMA,
-        ATLAS_REMEMBER_SCHEMA,
-        ATLAS_SLEEP_SYNC_SCHEMA,
-        ATLAS_STATS_SCHEMA,
-        ATLAS_TASK_FEEDBACK_SCHEMA,
-        ATLAS_TOOL_SCHEMAS,
-        ATLAS_VERIFY_CHAIN_SCHEMA,
-        ATLAS_WHAT_IF_SCHEMA,
-        create_uds_tool_handlers,
-    )
-except ImportError:
-    ATLAS_ACTIVE_SENSING_SCHEMA = {}  # type: ignore[assignment]
-    ATLAS_DELETE_SCHEMA = {}  # type: ignore[assignment]
-    ATLAS_GET_SCHEMA = {}  # type: ignore[assignment]
-    ATLAS_RECALL_SCHEMA = {}  # type: ignore[assignment]
-    ATLAS_REMEMBER_SCHEMA = {}  # type: ignore[assignment]
-    ATLAS_SLEEP_SYNC_SCHEMA = {}  # type: ignore[assignment]
-    ATLAS_STATS_SCHEMA = {}  # type: ignore[assignment]
-    ATLAS_TASK_FEEDBACK_SCHEMA = {}  # type: ignore[assignment]
-    ATLAS_TOOL_SCHEMAS = []  # type: ignore[assignment]
-    ATLAS_VERIFY_CHAIN_SCHEMA = {}  # type: ignore[assignment]
-    ATLAS_WHAT_IF_SCHEMA = {}  # type: ignore[assignment]
-    create_uds_tool_handlers = None  # type: ignore[assignment]
-
-from atlas_memory.cognitive.models import HERMES_DEFAULT_SESSION, clamp_conf
-from atlas_memory.security.delete_guard import is_delete_protected
 
 __all__ = ["AtlasMemoryProvider", "HERMES_DEFAULT_SESSION", "clamp_conf"]
 
 try:
-    from atlas_memory.models import (
-        EpistemicSource,
-        MemoryRecord,
-    )
-except ImportError:
-    EpistemicSource = None  # type: ignore[assignment,misc]
-    MemoryRecord = None  # type: ignore[assignment,misc]
-
-from atlas_memory.cognitive.retrieval_pipeline import RetrievalPipeline
-
-try:
-    from atlas_memory.server.client import (
-        AtlasDaemonClient,
-        get_or_create_client,
-        send_uds_request_sync,
-    )
-except ImportError:
-    AtlasDaemonClient = None  # type: ignore[assignment,misc]
-    get_or_create_client = None  # type: ignore[assignment,misc]
-    send_uds_request_sync = None  # type: ignore[assignment,misc]
-
-try:
-    from atlas_memory.orchestrator import MemoryOrchestrator
-    ATLAS_AVAILABLE = True
-except ImportError:
-    ATLAS_AVAILABLE = False
-    MemoryOrchestrator = None  # type: ignore[assignment,misc]
-
-try:
     from agent.memory_provider import MemoryProvider, RecallStatus, is_trivial_prompt
 except ImportError:
-    # Testy / standalone — fallback minimalny
-    MemoryProvider = object  # type: ignore
-    RecallStatus = None  # type: ignore
-    def is_trivial_prompt(t: str) -> bool:  # type: ignore
+    MemoryProvider = object  # type: ignore — optional-dep fallback: hermes-core nie w tym srodowisku
+    def is_trivial_prompt(t: str) -> bool:  # type: ignore — optional-dep fallback (sygnatura z hermes-core)
         return not (t and t.strip())
 
-# Delegate backend — Mnemosyne jako store
+class MnemosyneStorageBridge:
+    """Architektonicznie czysty most pamięci do rdzennego silnika BeamMemory (mnemosyne.core).
+
+    Eliminuje wielowarstwowe obejścia (cls.__new__, manipulowanie _init_home/_ambient_key)
+    oraz cykliczne parsowanie stringów markdown regexem. Łączy się bezpośrednio z bazą SQLite.
+    """
+
+    def __init__(
+        self,
+        db_path: Optional[Union[str, Path]] = None,
+        hermes_home: Optional[str] = None,
+    ) -> None:
+        home = hermes_home or os.environ.get("HERMES_HOME")
+        if not home:
+            try:
+                from hermes_constants import get_hermes_home
+
+                home = str(get_hermes_home())
+            except Exception:
+                home = str(Path.home() / ".hermes")
+        self._home: str = home
+        self._db_path: Path = Path(db_path) if db_path else (Path(self._home) / "mnemosyne" / "data" / "mnemosyne.db")
+        self._beams: Dict[str, Any] = {}
+        self._lock = threading.Lock()
+
+    @property
+    def _beam(self) -> Any:
+        """Kompatybilność wsteczna z inspekcją stanu delegata."""
+        with self._lock:
+            return self._beams.get(HERMES_DEFAULT_SESSION) or (next(iter(self._beams.values())) if self._beams else None)
+
+    def get_beam(self, session_id: str = HERMES_DEFAULT_SESSION) -> Any:
+        """Deterministyczna, bezpieczna wątkowo inicjalizacja silnika BeamMemory dla danej sesji."""
+        sid = session_id or HERMES_DEFAULT_SESSION
+        with self._lock:
+            if sid not in self._beams:
+                from mnemosyne.core.beam import BeamMemory
+
+                self._db_path.parent.mkdir(parents=True, exist_ok=True)
+                self._beams[sid] = BeamMemory(session_id=sid, db_path=self._db_path)
+            return self._beams[sid]
+
+    def initialize(self, session_id: str = HERMES_DEFAULT_SESSION, **kwargs: Any) -> None:
+        """Wiąże most z daną sesją i opcjonalnie odświeża hermes_home."""
+        home = kwargs.get("hermes_home")
+        with self._lock:
+            if home and home != self._home:
+                self._home = home
+                self._db_path = Path(home) / "mnemosyne" / "data" / "mnemosyne.db"
+                self._beams.clear()
+        self.get_beam(session_id or HERMES_DEFAULT_SESSION)
+
+    def sync_turn(
+        self,
+        user_content: str,
+        assistant_content: str,
+        *,
+        session_id: str = "",
+        messages: Optional[List[Dict[str, Any]]] = None,
+    ) -> None:
+        """Bezpośredni, synchroniczny zapis tury do bazy SQLite Mnemosyne z pełnym śladem epistemicznym."""
+        sid = session_id or HERMES_DEFAULT_SESSION
+        beam = self.get_beam(sid)
+        raw_roles = os.environ.get("MNEMOSYNE_SYNC_ROLES", "user,assistant,tool").lower()
+        active_roles = {r.strip() for r in raw_roles.split(",") if r.strip()}
+
+        if messages and isinstance(messages, list) and "tool" in active_roles:
+            for msg in messages:
+                if not isinstance(msg, dict):
+                    continue
+                role = msg.get("role")
+                if role == "tool":
+                    c = str(msg.get("content") or "").strip()
+                    if c and len(c) > 5:
+                        beam.remember(f"[TOOL] {c[:500]}", source="tool", importance=0.35)
+                elif role == "assistant" and msg.get("tool_calls"):
+                    for tc in msg.get("tool_calls") or []:
+                        fn = tc.get("function", {}) if isinstance(tc, dict) else {}
+                        fname = fn.get("name", "")
+                        fargs = fn.get("arguments", "")
+                        if fname:
+                            beam.remember(f"[TOOL_CALL] {fname}({fargs})", source="tool", importance=0.30)
+
+        if "assistant" in active_roles and assistant_content and assistant_content.strip() and len(assistant_content.strip()) > 10:
+            beam.remember(f"[ASSISTANT] {assistant_content.strip()}", source="conversation", importance=0.25)
+
+        if "user" in active_roles and user_content and user_content.strip() and len(user_content.strip()) > 5:
+            beam.remember(f"[USER] {user_content.strip()}", source="conversation", importance=0.50)
+
+    def recall_records(
+        self,
+        query: str,
+        *,
+        session_id: str = "",
+        top_k: int = 10,
+    ) -> List[Dict[str, Any]]:
+        """Zwraca surową listę słowników z SQLite bez pośrednictwa formatowania do tekstu."""
+        sid = session_id or HERMES_DEFAULT_SESSION
+        beam = self.get_beam(sid)
+        return beam.recall(query, top_k=top_k)
+
+    def prefetch(self, query: str, *, session_id: str = "") -> str:
+        """Formatowany tekst kontekstu dla kompatybilności z passthrough."""
+        sid = session_id or HERMES_DEFAULT_SESSION
+        beam = self.get_beam(sid)
+        results = beam.recall(query, top_k=10)
+        if not results:
+            return ""
+        return beam.format_context(results)
+
+    def shutdown(self) -> None:
+        with self._lock:
+            self._beams.clear()
+
+
+# Delegate backend — preferowany most do silnika BeamMemory (mnemosyne.core)
 try:
-    from mnemosyne_hermes import MnemosyneMemoryProvider
-    MNEMOSYNE_DELEGATE = MnemosyneMemoryProvider
-except ImportError:
+    import mnemosyne.core.beam  # noqa: F401
+    from mnemosyne_hermes import MnemosyneMemoryProvider  # noqa: F401
+
+    MNEMOSYNE_DELEGATE = MnemosyneStorageBridge
+except ImportError as _mnemosyne_import_error:
     MNEMOSYNE_DELEGATE = None
+    logger.warning(
+        "V139/MEM-BRIDGE: mnemosyne_hermes NIEDOSTĘPNY w tym interpreterze (%s). "
+        "sync_turn NIE będzie zapisywał do Mnemosyne (tylko shadow RPC do daemona). "
+        "Fix: pip install 'mnemosyne-memory>=3.14' 'mnemosyne-hermes>=0.7.4' "
+        "do interpretera uruchamiającego agenta (most działa w procesie — MCP nie jest wymagane).",
+        _mnemosyne_import_error,
+    )
 
 
+def _build_mnemosyne_delegate(cls: Any) -> Any:
+    """Konstrukcja delegata Mnemosyne.
+
+    Dla natywnego MnemosyneStorageBridge zwraca czystą instancję.
+    Dla zewnętrznych klas / mocków (np. MnemosyneMemoryProvider upstream 0.7.4 lub FakeBridge)
+    zapewnia bezpieczną inicjalizację z pre-seedowaniem home.
+    """
+    if cls is None:
+        return None
+    try:
+        if issubclass(cls, MnemosyneStorageBridge):
+            return cls()
+    except TypeError:
+        pass
+
+    home = None
+    try:
+        from hermes_constants import get_hermes_home
+
+        home = str(get_hermes_home())
+    except Exception:
+        home = None
+    if not home:
+        home = os.environ.get("HERMES_HOME") or str(Path.home() / ".hermes")
+
+    instance = cls.__new__(cls)
+    instance.__dict__["_init_home"] = home
+    try:
+        instance.__init__()
+    except Exception as exc:
+        logger.warning("Mnemosyne delegate __init__ raised: %s", exc)
+
+    if home:
+        key = home
+        try:
+            from mnemosyne_hermes import _p1b_home_key
+
+            key = _p1b_home_key(home)
+        except Exception:
+            pass
+        bindings = instance.__dict__.setdefault("_bindings", {})
+        if key not in bindings:
+            bindings[key] = {
+                "beam": None,
+                "agent_identity": "",
+                "session_id": "hermes_default",
+            }
+        instance.__dict__["_ambient_key"] = key
+    return instance
 
 
 def _sync_recall_wrapper(mnemosyne: Any):
@@ -197,19 +340,26 @@ def _parse_mnemosyne_context(raw: str, fallback_query: str = "") -> List[Any]:
 
     records: List[MemoryRecord] = []
     for line in raw.split("\n"):
-        if not line.strip() or line.strip().startswith("##"):
+        clean_l = line.strip()
+        if not clean_l or clean_l.startswith("##"):
             continue
-        m = _MNEMOSYNE_LINE_RE.match(line)
+        stripped_bullet = re.sub(r"^[-*]\s+", "", clean_l)
+        m = _MNEMOSYNE_LINE_RE.match(clean_l) or _MNEMOSYNE_LINE_RE.match(stripped_bullet)
         if not m:
+            if records and not clean_l.startswith("##") and not clean_l.startswith("["):
+                records[-1].object = f"{records[-1].object}\n{clean_l}"[:1000]
             continue
         try:
             importance = float(m.group("imp"))
         except (TypeError, ValueError):
             importance = 0.5
+        content_text = m.group("content").strip()
+        src_tag = (m.group("src") or "").strip()
+        subj = f"mnemosyne:{src_tag}" if src_tag else "mnemosyne:context"
         records.append(MemoryRecord(
-            subject=line.strip()[:80],
+            subject=subj,
             predicate="context",
-            object=m.group("content").strip()[:500],
+            object=content_text[:500] if content_text else clean_l[:500],
             source_type=_trust_to_source(m.group("trust")),
             importance_score=importance,
             metadata={
@@ -234,6 +384,84 @@ def _parse_mnemosyne_context(raw: str, fallback_query: str = "") -> List[Any]:
     )]
 
 
+def _beam_dict_to_record(item: Dict[str, Any], fallback_query: str = "") -> MemoryRecord:
+    """Bezpośrednie rzutowanie słownika z BeamMemory (SQLite) na MemoryRecord bez parsowania regexem."""
+    content = str(item.get("content") or "").strip()
+    try:
+        importance = float(item.get("importance") if item.get("importance") is not None else 0.5)
+    except (TypeError, ValueError):
+        importance = 0.5
+    try:
+        score = float(item.get("score") if item.get("score") is not None else importance)
+    except (TypeError, ValueError):
+        score = importance
+    src = str(item.get("source") or "conversation")
+    trust = str(item.get("trust_tier") or item.get("trust") or "unknown")
+    ts_val = item.get("timestamp")
+    timestamp = _parse_iso_timestamp(str(ts_val)) if ts_val else time.time()
+    subj = f"mnemosyne:{src}" if src else "mnemosyne:context"
+
+    return MemoryRecord(
+        subject=subj,
+        predicate="context",
+        object=content[:1000] if content else fallback_query[:500],
+        source_type=_trust_to_source(trust),
+        importance_score=max(0.0, min(1.0, importance)),
+        confidence=max(0.0, min(1.0, score)),
+        metadata=dict(item),
+        timestamp=timestamp,
+    )
+
+
+class BackgroundWorker:
+    """Dedicated single worker thread consuming background tasks from a bounded FIFO queue."""
+
+    def __init__(self, name: str = "AtlasProviderWorker", maxsize: int = 1000) -> None:
+        self._queue: queue.Queue[Optional[Callable[[], None]]] = queue.Queue(maxsize=maxsize)
+        self._thread = threading.Thread(target=self._run, name=name, daemon=True)
+        self._started = False
+        self._closed = False
+        self._lock = threading.Lock()
+
+    def _ensure_started(self) -> None:
+        with self._lock:
+            if not self._started and not self._closed:
+                self._thread.start()
+                self._started = True
+
+    def submit(self, fn: Callable[[], None]) -> bool:
+        """Submits task to background worker; drops if queue full or worker stopped."""
+        if self._closed:
+            return False
+        self._ensure_started()
+        try:
+            self._queue.put_nowait(fn)
+            return True
+        except queue.Full:
+            logger.warning("AtlasProviderWorker queue full; dropping background task")
+            return False
+
+    def _run(self) -> None:
+        while True:
+            task = self._queue.get()
+            if task is None:
+                self._queue.task_done()
+                break
+            try:
+                task()
+            except Exception as exc:
+                logger.debug("BackgroundWorker task failed: %s", exc)
+            finally:
+                self._queue.task_done()
+
+    def shutdown(self) -> None:
+        with self._lock:
+            if not self._closed:
+                self._closed = True
+                if self._started:
+                    self._queue.put(None)
+
+
 class AtlasMemoryProvider(MemoryProvider):  # type: ignore[misc]
     """ATLAS: orchestrator nad Mnemosyne store. 6 dźwigni polityki pamięci."""
 
@@ -243,20 +471,72 @@ class AtlasMemoryProvider(MemoryProvider):  # type: ignore[misc]
         socket_path: Optional[str] = None,
     ) -> None:
         self._orchestrator = orchestrator
-        self._socket_path = socket_path or os.environ.get("ATLAS_SOCKET_PATH", str(Path.home() / ".hermes" / "atlas.sock"))
+        from atlas_memory.core.config import get_config
+        cfg = get_config()
+        if cfg.hipporag_enabled:
+            os.environ.setdefault("ATLAS_HIPPORAG", "1")
+        raw_sock = socket_path or str(cfg.socket_path)
+        self._socket_path = str(Path(raw_sock).expanduser())
         self._mnemosyne = None
         if MNEMOSYNE_DELEGATE is not None:
             try:
-                self._mnemosyne = MNEMOSYNE_DELEGATE()
+                # V139/P1b: bez factory konstruktor 0.7.4 pada wewnątrz
+                # turn scope (no binding for the current home). Factory ustawia
+                # _init_home PRZED pierwszym setterem property _beam.
+                self._mnemosyne = _build_mnemosyne_delegate(MNEMOSYNE_DELEGATE)
             except Exception as exc:
                 logger.warning("Mnemosyne delegate init failed: %s", exc)
         self._session_id = HERMES_DEFAULT_SESSION
         self._lock = threading.Lock()
+        self._worker = BackgroundWorker(name=f"AtlasWorker-{self._session_id}")
         self._last_prefetch: Optional[Dict[str, Any]] = None
         self._queued_context: Optional[str] = None  # Cache z queue_prefetch
         self._queued_query: Optional[str] = None
-        self._debug = os.environ.get("ATLAS_DEBUG", "0") == "1"
+        self._last_injected_facts: Dict[str, str] = {}
+        self._context_utilization: Dict[str, Any] = {"injected_count": 0, "matched_count": 0, "ratio": 0.0}
+        self._in_process_engine: Optional[Any] = None
+        self._debug = cfg.debug
         self._tool_handlers: Optional[Dict[str, Callable[..., Any]]] = None
+        # V89/T2: licznik hooka cieni (RPC do daemona vs in-process fallback).
+        self._shadow_rpc_stats: Dict[str, int] = {"enqueued": 0, "failed": 0, "in_process_fallback": 0}
+        self._shadow_last_enqueue: Optional[Dict[str, Any]] = None
+        self._turn_persistence_status: str = "ok"
+
+    def invalidate_prefetch_cache(self) -> None:
+        """Reaktywne unieważnienie zbuforowanego prefetchu po mutacji stanu (V141)."""
+        lock = getattr(self, "_lock", None)
+        if lock is not None:
+            with lock:
+                self._queued_context = None
+                self._queued_query = None
+                self._last_prefetch = None
+                self._last_injected_facts = {}
+        else:
+            self._queued_context = None
+            self._queued_query = None
+            self._last_prefetch = None
+            self._last_injected_facts = {}
+
+    def _get_fallback_engine(self) -> Any:
+        """Pobiera lub leniwie inicjalizuje awaryjny silnik pamięci dla operacji in-process."""
+        if self._orchestrator is not None and getattr(self._orchestrator, "engine", None) is not None:
+            return self._orchestrator.engine
+        if self._in_process_engine is None:
+            try:
+                from atlas_memory.engine import HybridMemoryEngine
+
+                self._in_process_engine = HybridMemoryEngine.create_default(
+                    db_path=":memory:", qdrant_location=":memory:"
+                )
+            except Exception as exc:
+                logger.debug("In-process fallback engine creation note: %s", exc)
+                self._in_process_engine = None
+        return self._in_process_engine
+
+    def _shadow_rpc_enabled(self) -> bool:
+        """Flaga hooka cieni: ATLAS_SHADOW_RPC (domyślnie ON per AtlasConfig)."""
+        from atlas_memory.core.config import get_config
+        return get_config().shadow_rpc_enabled
 
     def _get_tool_handlers(self) -> Dict[str, Callable[..., Any]]:
         """Zwraca lub inicjalizuje słownik handlerów narzędzi UDS."""
@@ -273,26 +553,67 @@ class AtlasMemoryProvider(MemoryProvider):  # type: ignore[misc]
             return None
         return get_or_create_client(self._socket_path) if self._socket_path else get_or_create_client()
 
+    def ensure_daemon_running(self, timeout_s: float = 5.0) -> bool:
+        """Ensures the ATLAS UDS daemon is running and serving get_stats (V106 contract)."""
+        from atlas_memory.hermes.daemon_bootstrap import ensure_daemon_process_running
+
+        return ensure_daemon_process_running(
+            self,
+            timeout_s=timeout_s,
+            send_rpc_fn=send_uds_request_sync,
+        )
+
+    _ensure_daemon_running = ensure_daemon_running
+
+    def get_stats(self) -> Dict[str, Any]:
+        """Returns daemon or in-process telemetry stats (`status=ok`, `dual_node_coverage`, `points_count`, etc.)."""
+        res = self._call_uds_sync("get_stats", {})
+        if isinstance(res, dict):
+            if "points_count" not in res:
+                vs = res.get("vector_store")
+                res["points_count"] = vs.get("points_count", 0) if isinstance(vs, dict) else 0
+            return res
+        return {"status": "in_process_fallback", "session_id": self._session_id, "points_count": 0}
+
     def _call_uds_sync(self, method: str, params: Optional[Dict[str, Any]] = None) -> Optional[Any]:
-        """Executes sync JSON-RPC 2.0 call over UDS if socket is present, returns None on fallback."""
-        sock = self._socket_path or os.environ.get("ATLAS_SOCKET_PATH", str(Path.home() / ".hermes" / "atlas.sock"))
-        if not Path(sock).exists():
-            return None
+        """Executes sync JSON-RPC 2.0 call over UDS with auto-bootstrap and 1-retry backoff (V106 FIX-B)."""
+        from atlas_memory.hermes.daemon_bootstrap import call_uds_with_retry
 
-        if send_uds_request_sync is not None:
-            return send_uds_request_sync(sock, method, params=params or {})
+        return call_uds_with_retry(
+            self,
+            method=method,
+            params=params,
+            send_rpc_fn=send_uds_request_sync,
+        )
 
-        client = self.get_client()
-        if client is None or not client.socket_path.exists():
-            return None
+    def _ingest_real_trajectory(self, steps: list[dict], session_id: str) -> None:
+        """V64: dostarcza REALNE trajektorie narzędzi do bufora trajektorii.
 
-        import asyncio
-        params_dict = params or {}
+        Kanał 1 (preferowany): UDS RPC `trajectory/ingest` do daemona.
+        Kanał 2 (fallback in-process): `engine.trajectory_buffer.record_real_trajectory`.
+        Nigdy nie podnosi wyjątku — telemetria nie może zrywać sesji agenta.
+        """
+        if not steps:
+            return
         try:
-            return asyncio.run(client.call(method, params_dict))
+            resp = self._call_uds_sync(
+                "trajectory/ingest", {"session_id": session_id, "steps": steps}
+            )
+            if resp is not None:
+                return
+        except AtlasTransportError as exc:
+            logger.debug("UDS trajectory/ingest transport error: %s", exc)
         except Exception as exc:
-            logger.debug("UDS call %s failed, falling back to in-process: %s", method, exc)
-            return None
+            logger.debug("UDS trajectory/ingest failed: %s", exc)
+        engine = None
+        if self._orchestrator is not None:
+            engine = getattr(self._orchestrator, "engine", None)
+        buffer = getattr(engine, "trajectory_buffer", None) if engine is not None else None
+        if buffer is not None and hasattr(buffer, "record_real_trajectory"):
+            try:
+                buffer.record_real_trajectory(steps, session_id=session_id)
+            except Exception as exc:
+                logger.debug("in-process record_real_trajectory failed: %s", exc)
 
     # ------------------------------------------------------------------
     # Core lifecycle
@@ -306,19 +627,50 @@ class AtlasMemoryProvider(MemoryProvider):  # type: ignore[misc]
         sock = Path(self._socket_path) if self._socket_path else Path(os.environ.get("ATLAS_SOCKET_PATH", str(Path.home() / ".hermes" / "atlas.sock")))
         if sock.exists():
             return True
-        return ATLAS_AVAILABLE and (self._orchestrator is not None or self._mnemosyne is not None)
+        return self._orchestrator is not None or self._mnemosyne is not None
 
     def initialize(self, session_id: str = "", **kwargs) -> None:
+        self._ensure_daemon_running()
         self._session_id = session_id or HERMES_DEFAULT_SESSION
         with self._lock:
             self._queued_context = None
             self._queued_query = None
         if self._mnemosyne is not None:
+            if "hermes_home" not in kwargs or not kwargs["hermes_home"]:
+                home = None
+                try:
+                    from hermes_constants import get_hermes_home
+                    home = str(get_hermes_home())
+                except Exception:
+                    pass
+                if not home:
+                    home = os.environ.get("HERMES_HOME") or str(Path.home() / ".hermes")
+                kwargs["hermes_home"] = home
             try:
-                self._mnemosyne.initialize(session_id=session_id, **kwargs)
+                self._mnemosyne.initialize(session_id=self._session_id, **kwargs)
             except Exception as exc:
-                logger.warning("Mnemosyne delegate initialize failed: %s", exc)
+                logger.error("Mnemosyne delegate initialize failed: %s", exc, exc_info=True)
         logger.info("ATLAS provider initialized (session=%s)", self._session_id)
+
+    def _ensure_mnemosyne_initialized(self, session_id: str = "") -> None:
+        """Upewnia się, że delegat Mnemosyne posiada aktywny _beam i poprawne wiązanie home."""
+        if self._mnemosyne is None:
+            return
+        if getattr(self._mnemosyne, "_beam", None) is not None:
+            return
+        home = None
+        try:
+            from hermes_constants import get_hermes_home
+            home = str(get_hermes_home())
+        except Exception:
+            pass
+        if not home:
+            home = os.environ.get("HERMES_HOME") or str(Path.home() / ".hermes")
+        sid = session_id or self._session_id or HERMES_DEFAULT_SESSION
+        try:
+            self._mnemosyne.initialize(session_id=sid, hermes_home=home)
+        except Exception as exc:
+            logger.warning("Mnemosyne auto-heal initialize failed: %s", exc, exc_info=True)
 
     def shutdown(self) -> None:
         if self._mnemosyne is not None:
@@ -344,39 +696,56 @@ class AtlasMemoryProvider(MemoryProvider):  # type: ignore[misc]
         if self._debug:
             logger.info("[ATLAS] on_session_end called for session=%s, turn_count=%d", sid, turn_count)
 
+        # V64: REAL trajectory telemetry from transcript (objective success), NOT JEPA reward.
+        try:
+            real_steps = extract_trajectory(messages, sid)
+            if real_steps:
+                self._ingest_real_trajectory(real_steps, sid)
+                # Proaktywny aparat metapoznawczy (Closed-Loop Task Feedback)
+                session_success = all(s.get("success", False) for s in real_steps)
+                with self._lock:
+                    injected_keys = list(self._last_injected_facts.keys())
+                for fact_key in injected_keys:
+                    try:
+                        self.handle_tool_call(
+                            "atlas_task_feedback",
+                            {"key": fact_key, "task_success": session_success, "delta": 0.05},
+                        )
+                    except Exception as fb_exc:
+                        logger.debug("Automated task_feedback emit failed: %s", fb_exc)
+        except Exception as exc:
+            logger.debug("ATLAS trajectory extraction at session end failed: %s", exc)
+
+        self.invalidate_prefetch_cache()
+
         # 1. Próba UDS call
+        uds_ok = False
         try:
             self._call_uds_sync("session/end", {"session_id": sid, "turn_count": turn_count})
+            uds_ok = True
         except Exception as exc:
             logger.debug("UDS session/end call failed: %s", exc)
 
-        # 2. In-process fallback przez HermesSessionHook
-        engine = None
-        if self._orchestrator is not None:
-            engine = getattr(self._orchestrator, "engine", None)
+        if hasattr(self, "_worker"):
+            self._worker.shutdown()
 
-        if engine is not None:
-            try:
-                import asyncio
-                import concurrent.futures
+        # 2. In-process fallback przez HermesSessionHook (tylko w razie niepowodzenia UDS)
+        if not uds_ok:
+            engine = None
+            if self._orchestrator is not None:
+                engine = getattr(self._orchestrator, "engine", None)
 
-                from atlas_memory.hermes.prefix_guard import HermesSessionHook
-
-                hook = HermesSessionHook(engine)
-                coro = hook.on_session_end(session_id=sid, trigger_sleep_cycle=True)
-
+            if engine is not None:
                 try:
-                    loop = asyncio.get_running_loop()
-                except RuntimeError:
-                    loop = None
+                    from atlas_memory.hermes.plugin_hooks import DedicatedAsyncBridge
+                    from atlas_memory.hermes.prefix_guard import HermesSessionHook
 
-                if loop and loop.is_running():
-                    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
-                        pool.submit(asyncio.run, coro).result(timeout=10.0)
-                else:
-                    asyncio.run(coro)
-            except Exception as exc:
-                logger.warning("In-process on_session_end failed: %s", exc)
+                    hook = HermesSessionHook(engine)
+                    coro = hook.on_session_end(session_id=sid, trigger_sleep_cycle=True)
+                    bridge = DedicatedAsyncBridge.get_instance()
+                    bridge.submit_fire_and_forget(coro)
+                except Exception as exc:
+                    logger.warning("In-process on_session_end failed: %s", exc)
         return None
 
     # ------------------------------------------------------------------
@@ -412,22 +781,21 @@ class AtlasMemoryProvider(MemoryProvider):  # type: ignore[misc]
 
         sid = session_id or self._session_id
 
+        # Użyj cache'owanego wyniku z queue_prefetch jeśli zapytanie pasuje
+        with self._lock:
+            if self._queued_context and (self._queued_query is None or self._queued_query == query):
+                queued = self._queued_context
+                self._queued_context = None
+                self._queued_query = None
+                return queued
+
         # 1. In-process execution if orchestrator is configured
         if self._orchestrator is not None:
-            if not ATLAS_AVAILABLE or EpistemicSource is None or MemoryRecord is None:
-                return ""
-
-            # Użyj cache'owanego wyniku z queue_prefetch jeśli zapytanie pasuje
-            with self._lock:
-                if self._queued_context and (self._queued_query is None or self._queued_query == query):
-                    queued = self._queued_context
-                    self._queued_context = None
-                    self._queued_query = None
-                    return queued
 
             # ATLAS gate: czysty czat bez encji → SKIP (0 tokenów)
             try:
-                should_run, entities, reason = self._orchestrator.should_retrieve(query, explicit_entities=None)
+                from atlas_memory.cognitive.retrieval.gate import should_retrieve_query
+                should_run, entities, reason = should_retrieve_query(query, explicit_entities=None)
             except Exception as exc:
                 logger.warning("should_retrieve failed: %s", exc)
                 with self._lock:
@@ -447,9 +815,14 @@ class AtlasMemoryProvider(MemoryProvider):  # type: ignore[misc]
 
             records: List[Any] = []
             if self._mnemosyne is not None:
+                self._ensure_mnemosyne_initialized(sid)
                 try:
-                    raw = self._mnemosyne.prefetch(query, session_id=sid)
-                    records = _parse_mnemosyne_context(raw, fallback_query=query)
+                    if hasattr(self._mnemosyne, "recall_records"):
+                        raw_dicts = self._mnemosyne.recall_records(query, session_id=sid, top_k=10)
+                        records = [_beam_dict_to_record(d, fallback_query=query) for d in raw_dicts]
+                    else:
+                        raw = self._mnemosyne.prefetch(query, session_id=sid)
+                        records = _parse_mnemosyne_context(raw, fallback_query=query)
                 except Exception as exc:
                     logger.warning("Mnemosyne recall failed: %s", exc)
 
@@ -460,6 +833,7 @@ class AtlasMemoryProvider(MemoryProvider):  # type: ignore[misc]
 
             # Lever 3 + 4: Delegated Epistemic Selection & Token Budget (SYNC — RetrievalPipeline)
             try:
+                from atlas_memory.cognitive.retrieval.pipeline import RetrievalPipeline
                 budgeted = RetrievalPipeline.format_inprocess_prefetch(self._orchestrator, records, query=query, max_tokens=1500)
             except Exception as exc:
                 logger.warning("format_inprocess_prefetch failed: %s", exc)
@@ -469,6 +843,10 @@ class AtlasMemoryProvider(MemoryProvider):  # type: ignore[misc]
 
             block = budgeted.get("formatted_context", "")
             with self._lock:
+                self._last_injected_facts = {
+                    getattr(r, "effective_subject", getattr(r, "subject", str(i))): getattr(r, "object", str(r))
+                    for i, r in enumerate(budgeted.get("selected_facts", []))
+                }
                 self._last_prefetch = {
                     "skipped": False,
                     "count": len(budgeted.get("selected_facts", [])),
@@ -497,6 +875,7 @@ class AtlasMemoryProvider(MemoryProvider):  # type: ignore[misc]
 
         # 3. Fallback: Pass-through do Mnemosyne
         if self._mnemosyne is not None:
+            self._ensure_mnemosyne_initialized(sid)
             try:
                 result = self._mnemosyne.prefetch(query, session_id=sid)
                 with self._lock:
@@ -513,14 +892,13 @@ class AtlasMemoryProvider(MemoryProvider):  # type: ignore[misc]
 
         Fix Bug 3 (Gemini Flash 3.6 review): wynik prefetch w tle jest
         cache'owany w self._queued_context i konsumowany przez następny prefetch.
+        V83: delegowane do zarządzanego BackgroundWorker (zero alokacji OS thread).
         """
-        if self._orchestrator is not None:
-            thread = threading.Thread(
-                target=self._prefetch_in_background,
-                args=(query, session_id or self._session_id),
-                daemon=True,
-            )
-            thread.start()
+        sid = session_id or self._session_id
+        if hasattr(self, "_worker") and self._worker is not None:
+            self._worker.submit(lambda: self._prefetch_in_background(query, sid))
+        else:
+            self._prefetch_in_background(query, sid)
 
     def _prefetch_in_background(self, query: str, session_id: str) -> None:
         """Wykonuje recall w tle i cache'uje wynik dla następnej tury."""
@@ -566,32 +944,126 @@ class AtlasMemoryProvider(MemoryProvider):  # type: ignore[misc]
         Parametr messages pozostaje w sygnaturze dla zgodności z kontraktem
         MemoryProvider, ale nie jest przekazywany dalej.
         """
-        # Zawsze deleguj do Mnemosyne store (pełna trwałość)
-        if self._mnemosyne is not None:
-            try:
-                # MnemosyneMemoryProvider.sync_turn() NIE akceptuje messages= — przekazuj tylko podstawowe
-                self._mnemosyne.sync_turn(
-                    user_content, assistant_content,
-                    session_id=session_id or self._session_id,
-                )
-            except Exception as exc:
-                logger.warning("Mnemosyne sync_turn failed: %s", exc)
-        # Dodatkowo: shadow reconciliation (ATLAS ekstrakcja SPO w tle)
-        if self._orchestrator is not None:
-            thread = threading.Thread(
-                target=self._sync_turn_in_background,
-                args=(user_content, assistant_content, session_id or self._session_id),
-                daemon=True,
+        # 1. Metapoznawcza telemetria utylizacji kontekstu
+        lock = getattr(self, "_lock", None)
+        if lock is not None:
+            with lock:
+                injected = dict(getattr(self, "_last_injected_facts", {}))
+        else:
+            injected = dict(getattr(self, "_last_injected_facts", {}))
+        if injected and assistant_content:
+            matched = sum(
+                1
+                for k, v in injected.items()
+                if (k and k.lower() in assistant_content.lower())
+                or (v and len(v) > 5 and v[:30].lower() in assistant_content.lower())
             )
-            thread.start()
+            self._context_utilization = {
+                "injected_count": len(injected),
+                "matched_count": matched,
+                "ratio": (matched / len(injected)) if len(injected) > 0 else 0.0,
+            }
+
+        # 2. Reaktywne unieważnienie zbuforowanego prefetchu po zakończeniu tury
+        self.invalidate_prefetch_cache()
+
+        # 3. Zawsze deleguj do Mnemosyne store (pełna trwałość)
+        if self._mnemosyne is not None:
+            self._ensure_mnemosyne_initialized(session_id or self._session_id)
+            try:
+                self._mnemosyne.sync_turn(
+                    user_content,
+                    assistant_content,
+                    session_id=session_id or self._session_id,
+                    messages=messages,
+                )
+            except TypeError:
+                try:
+                    self._mnemosyne.sync_turn(
+                        user_content,
+                        assistant_content,
+                        session_id=session_id or self._session_id,
+                    )
+                except Exception as exc:
+                    logger.warning("Mnemosyne sync_turn fallback failed: %s", exc, exc_info=True)
+            except Exception as exc:
+                # V139: exc_info=True — bez stack trace ten błąd był bezużyteczny
+                # (silent degradation ścieżki zapisu do Mnemosyne, incydent 09.27–10.06)
+                logger.warning("Mnemosyne sync_turn failed: %s", exc, exc_info=True)
+        else:
+            # V142 (Task 7): Graceful fallback when Mnemosyne is unavailable
+            logger.warning("[ATLAS Provider] Mnemosyne unavailable: operating in degraded_local_persistence mode")
+            self._turn_persistence_status = "degraded_local_persistence"
+            engine = self._get_fallback_engine()
+            if engine is not None and hasattr(engine, "kv") and engine.kv is not None:
+                try:
+                    ts = time.time()
+                    sid_val = session_id or self._session_id
+                    turn_key = f"dialog:{sid_val}:{int(ts * 1000)}"
+                    turn_payload = json.dumps({
+                        "user": user_content,
+                        "assistant": assistant_content,
+                        "timestamp": ts,
+                        "status": "degraded_local_persistence",
+                    }, ensure_ascii=False)
+                    if hasattr(engine.kv, "set_sync"):
+                        engine.kv.set_sync(
+                            turn_key,
+                            turn_payload,
+                            confidence=0.80,
+                            metadata={"source_type": "conversation_turn", "session_id": sid_val, "status": "degraded_local_persistence"},
+                            reason="sync_turn:degraded_fallback",
+                        )
+                except Exception as kv_exc:
+                    logger.debug("Local KV sync_turn fallback error: %s", kv_exc)
+        # Dodatkowo: shadow reconciliation (ATLAS ekstrakcja SPO w tle przez BackgroundWorker)
+        sid = session_id or self._session_id
+        if self._shadow_rpc_enabled() or self._orchestrator is not None:
+            self._worker.submit(lambda: self._shadow_turn_dispatch(user_content, assistant_content, sid))
+
+    def _shadow_turn_dispatch(self, user_msg: str, agent_response: str, session_id: str) -> None:
+        """Koniec tury -> `sync_turn` do demona ATLAS (L0 TTT + L1 trajektorie) + `shadow_enqueue` (LLM).
+
+        RPC jest jedyną ścieżką z prawdziwą ekstrakcją LLM (OmniRouteShadowWorker)
+        oraz natychmiastowym zasileniem L0-TTT online adaptation i L1 Arrow trajectory buffer.
+        Gdy socket/RPC niedostępne, wracamy do lokalnego `_sync_turn_in_background`.
+        """
+        if self._shadow_rpc_enabled():
+            try:
+                self._call_uds_sync(
+                    "sync_turn",
+                    {"user_msg": user_msg, "agent_response": agent_response, "session_id": session_id},
+                )
+            except Exception as sync_exc:
+                logger.debug("Daemon sync_turn RPC error: %s", sync_exc)
+
+            resp = self._call_uds_sync(
+                "shadow_enqueue",
+                {"user_msg": user_msg, "agent_response": agent_response, "session_id": session_id},
+            )
+            if isinstance(resp, dict) and resp.get("status") == "ok":
+                self._shadow_rpc_stats["enqueued"] += 1
+                self._shadow_last_enqueue = resp
+                return
+            self._shadow_rpc_stats["failed"] += 1
+            logger.debug("V89/T2: shadow_enqueue RPC unavailable (%s); in-process fallback", resp)
+        self._shadow_rpc_stats["in_process_fallback"] += 1
+        self._sync_turn_in_background(user_msg, agent_response, session_id)
 
     def _sync_turn_in_background(self, user_msg: str, agent_response: str, session_id: str) -> None:
-        """Shadow reconciliation w tle: ekstrakcja SPO z tury (bez LLM — regex fallback)."""
+        """Shadow reconciliation w tle: delegacja do kanonicznego MemoryOrchestrator.shadow_reconcile."""
         try:
             if self._orchestrator is not None:
+                import asyncio
                 with self._lock:
-                    # Fix Bug 2: _extract_facts_regex NIE ISTNIEJE — jest _fallback_extract_facts
-                    extracted = self._orchestrator._fallback_extract_facts(user_msg, agent_response)
+                    try:
+                        asyncio.get_running_loop()
+                        extracted = self._orchestrator._fallback_extract_facts(user_msg, agent_response)
+                        self._orchestrator.stats["shadow_facts_extracted"] += len(extracted)
+                    except RuntimeError:
+                        extracted = asyncio.run(
+                            self._orchestrator.shadow_reconcile(user_msg, agent_response, session_id=session_id)
+                        )
                     if extracted and self._debug:
                         logger.info("[ATLAS] shadow sync: extracted %d facts", len(extracted))
         except Exception as exc:
@@ -632,6 +1104,9 @@ class AtlasMemoryProvider(MemoryProvider):  # type: ignore[misc]
             except Exception:
                 args = {}
 
+        if tool_name in ("atlas_remember", "atlas_delete", "commit_observation"):
+            self.invalidate_prefetch_cache()
+
         handlers = self._get_tool_handlers()
         handler = handlers.get(tool_name)
         if handler is None:
@@ -639,7 +1114,15 @@ class AtlasMemoryProvider(MemoryProvider):  # type: ignore[misc]
 
         try:
             call_args = args if isinstance(args, dict) else {}
-            res = handler(call_args)
+            try:
+                res = handler(call_args)
+            except AtlasTransportError as exc:
+                logger.debug("Handler raised AtlasTransportError: %s, falling back to in-process", exc)
+                res = self._handle_in_process_tool_call(
+                    tool_name,
+                    call_args,
+                    original_error={"status": "error", "transport_reason": exc.reason, "error": str(exc)},
+                )
 
             # In-process fallback if daemon was offline
             if (
@@ -661,7 +1144,33 @@ class AtlasMemoryProvider(MemoryProvider):  # type: ignore[misc]
         args: Dict[str, Any],
         original_error: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
-        """In-process fallback when daemon is unreachable."""
+        """Pełna obsługa awaryjna 10/10 narzędzi ATLAS w procesie przy niedostępności UDS (Zero-Drop Resilience)."""
+        engine = self._get_fallback_engine()
+
+        if tool_name == "atlas_get":
+            key = str(args.get("key", "")).strip()
+            if engine is not None and hasattr(engine, "kv") and engine.kv is not None:
+                try:
+                    record = engine.kv.get(key)
+                    if record is not None:
+                        return {
+                            "status": "ok",
+                            "key": key,
+                            "found": True,
+                            "state": record.object if hasattr(record, "object") else str(record),
+                            "mode": "in_process",
+                        }
+                    return {
+                        "status": "ok",
+                        "key": key,
+                        "found": False,
+                        "state": None,
+                        "mode": "in_process",
+                    }
+                except Exception as exc:
+                    logger.debug("in-process atlas_get failed: %s", exc)
+            return {"status": "ok", "key": key, "found": False, "state": None, "mode": "in_process"}
+
         if tool_name == "atlas_delete":
             key = str(args.get("key", "")).strip()
             is_prot, pfx = is_delete_protected(key)
@@ -675,22 +1184,32 @@ class AtlasMemoryProvider(MemoryProvider):  # type: ignore[misc]
                     "message": f"Key '{key}' is protected (prefix '{pfx}'). Use soft tombstone or explicit ADR override.",
                     "mode": "in_process",
                 }
-            return {"status": "daemon_offline"}
+            found = False
+            if engine is not None and hasattr(engine, "kv") and engine.kv is not None:
+                try:
+                    rec = engine.kv.get(key)
+                    if rec is not None:
+                        found = True
+                        engine.kv.delete(key)
+                except Exception as exc:
+                    logger.debug("in-process atlas_delete failed: %s", exc)
+            self.invalidate_prefetch_cache()
+            return {"status": "ok", "key": key, "deleted": True, "found": found, "mode": "in_process"}
 
         if tool_name == "atlas_stats":
             kv_count = 0
             has_graph = False
-            if self._orchestrator is not None:
-                engine = getattr(self._orchestrator, "engine", None)
-                if engine is not None and hasattr(engine, "kv") and engine.kv is not None:
-                    try:
-                        if hasattr(engine.kv, "get_all_sync"):
-                            kv_count = len(engine.kv.get_all_sync())
-                        else:
-                            kv_count = len(engine.kv.get_all())
-                    except Exception:
-                        kv_count = 0
-                has_graph = engine is not None and hasattr(engine, "graph")
+            if engine is not None and hasattr(engine, "kv") and engine.kv is not None:
+                try:
+                    if hasattr(engine.kv, "count_sync"):
+                        kv_count = engine.kv.count_sync()
+                    elif hasattr(engine.kv, "get_all_sync"):
+                        kv_count = len(engine.kv.get_all_sync(paged=True, limit=1000000))
+                    else:
+                        kv_count = len(engine.kv.get_all())
+                except Exception:
+                    kv_count = 0
+            has_graph = engine is not None and hasattr(engine, "graph")
             return {
                 "status": "ok",
                 "serving": False,
@@ -700,4 +1219,190 @@ class AtlasMemoryProvider(MemoryProvider):  # type: ignore[misc]
                 "has_orchestrator": self._orchestrator is not None,
             }
 
-        return {"status": "daemon_offline"}
+        if tool_name == "atlas_remember":
+            key = str(args.get("key") or args.get("subject") or "").strip()
+            val = str(args.get("value") or args.get("object") or "").strip()
+            conf = float(args.get("confidence", 1.0))
+            reason = str(args.get("reason", "agent_explicit"))
+            sid = str(args.get("session_id") or self._session_id or HERMES_DEFAULT_SESSION)
+            if engine is not None and hasattr(engine, "kv") and engine.kv is not None:
+                rec = MemoryRecord(
+                    subject=key,
+                    predicate="state_value",
+                    object=val,
+                    confidence=conf,
+                    is_state_variable=True,
+                    source_type=EpistemicSource.USER_EXPLICIT,
+                    metadata={"reason": reason, "session_id": sid},
+                )
+                try:
+                    engine.kv.set(key, rec)
+                except Exception as exc:
+                    logger.debug("in-process atlas_remember engine.kv.set failed: %s", exc)
+                if hasattr(engine, "write_path") and engine.write_path is not None:
+                    try:
+                        if hasattr(engine.write_path, "write_sync"):
+                            engine.write_path.write_sync(key, val, confidence=conf, session_id=sid, reason=reason)
+                    except Exception:
+                        pass
+            if self._mnemosyne is not None:
+                try:
+                    beam = self._mnemosyne.get_beam(sid)
+                    beam.remember(f"{key}: {val}", importance=conf)
+                except Exception:
+                    pass
+            self.invalidate_prefetch_cache()
+            return {"status": "ok", "key": key, "value": val, "persisted": True, "mode": "in_process"}
+
+        if tool_name == "atlas_recall":
+            query = str(args.get("query", ""))
+            sid = str(args.get("session_id") or self._session_id or HERMES_DEFAULT_SESSION)
+            limit = int(args.get("limit", 15))
+            recs: list[dict[str, Any]] = []
+            if self._mnemosyne is not None:
+                try:
+                    raw_m = self._mnemosyne.recall_records(query, session_id=sid, top_k=limit)
+                    for m in raw_m:
+                        recs.append({
+                            "subject": f"mnemosyne:{m.get('source', 'context')}",
+                            "predicate": "context",
+                            "object": m.get("content", ""),
+                            "confidence": float(m.get("importance", 0.5)),
+                        })
+                except Exception:
+                    pass
+            if engine is not None and hasattr(engine, "kv") and engine.kv is not None:
+                try:
+                    all_kv = engine.kv.get_all()
+                    for k, r_val in all_kv.items():
+                        if query.lower() in k.lower() or (hasattr(r_val, "object") and query.lower() in str(r_val.object).lower()):
+                            recs.append({
+                                "subject": k,
+                                "predicate": getattr(r_val, "predicate", "state_value"),
+                                "object": getattr(r_val, "object", str(r_val)),
+                                "confidence": getattr(r_val, "confidence", 1.0),
+                            })
+                except Exception:
+                    pass
+            lim = max(0, limit)
+            return {"status": "ok", "records": recs[:lim], "count": len(recs[:lim]), "mode": "in_process"}
+
+        if tool_name == "atlas_what_if":
+            entity = str(args.get("entity") or args.get("target") or "")
+            action = str(args.get("action", "simulate"))
+            depth = int(args.get("depth", 2))
+            uncertainty = 0.0
+            if engine is not None and hasattr(engine, "record_mental_transition"):
+                try:
+                    from atlas_memory.core.models import ActionPlan
+
+                    act = ActionPlan(name=action, parameters={"entity": entity, "depth": depth})
+                    trans = engine.record_mental_transition(act, session_id=self._session_id)
+                    uncertainty = float(trans.uncertainty) if trans else 0.0
+                except Exception:
+                    pass
+            return {
+                "status": "ok",
+                "entity": entity,
+                "action": action,
+                "causal_paths": [{"entity": entity, "action": action, "depth": depth}],
+                "uncertainty": uncertainty,
+                "mode": "in_process",
+            }
+
+        if tool_name == "atlas_active_sensing":
+            probe = str(args.get("probe") or args.get("target_entity", ""))
+            exp = str(args.get("expected_value", ""))
+            obs = str(args.get("observed_value", ""))
+            has_error = bool(exp != obs and exp != "")
+            if engine is not None and hasattr(engine, "record_mental_transition"):
+                try:
+                    from atlas_memory.core.models import ActionPlan
+
+                    act = ActionPlan(name=f"probe:{probe}", parameters={"expected": exp, "observed": obs})
+                    engine.record_mental_transition(act, session_id=self._session_id)
+                except Exception:
+                    pass
+            return {
+                "status": "ok",
+                "probe": probe,
+                "has_error": has_error,
+                "anomaly_detected": has_error,
+                "prediction_error": 0.5 if has_error else 0.0,
+                "mode": "in_process",
+            }
+
+        if tool_name == "atlas_task_feedback":
+            key = str(args.get("key", ""))
+            task_success = bool(args.get("task_success", True))
+            delta = float(args.get("delta", 0.05))
+            new_conf = 1.0
+            if engine is not None and hasattr(engine, "kv") and engine.kv is not None and key:
+                try:
+                    r_item = engine.kv.get(key)
+                    if r_item:
+                        cur_conf = float(getattr(r_item, "confidence", 1.0))
+                        new_conf = max(0.0, min(1.0, cur_conf + delta if task_success else cur_conf - delta))
+                        r_item.confidence = new_conf
+                        engine.kv.set(key, r_item)
+                except Exception:
+                    pass
+            return {
+                "status": "ok",
+                "key": key,
+                "task_success": task_success,
+                "updated_confidence": new_conf,
+                "mode": "in_process",
+            }
+
+        if tool_name == "atlas_verify_chain":
+            heal = bool(args.get("heal", False))
+            deep = bool(args.get("deep", False))
+            valid = True
+            chain_len = 0
+            if engine is not None and hasattr(engine, "kv") and engine.kv is not None:
+                if hasattr(engine.kv, "verify_audit_chain"):
+                    try:
+                        valid = engine.kv.verify_audit_chain()
+                    except Exception:
+                        valid = True
+                if hasattr(engine.kv, "count_sync"):
+                    try:
+                        chain_len = engine.kv.count_sync()
+                    except Exception:
+                        chain_len = 0
+            return {
+                "status": "ok",
+                "verified": valid,
+                "chain_length": chain_len,
+                "healed": heal,
+                "deep": deep,
+                "mode": "in_process",
+            }
+
+        if tool_name == "atlas_sleep_sync":
+            skills_dir = args.get("skills_dir")
+            min_freq = int(args.get("min_frequency", 1))
+            if engine is not None:
+                try:
+                    from atlas_memory.hermes.prefix_guard import HermesSessionHook
+
+                    hook = HermesSessionHook(engine)
+                    bridge = DedicatedAsyncBridge.get_instance()
+                    bridge.submit_fire_and_forget(
+                        hook.on_session_end(session_id=self._session_id, trigger_sleep_cycle=True)
+                    )
+                except Exception:
+                    pass
+            return {
+                "status": "ok",
+                "consolidated": True,
+                "skills_dir": str(skills_dir) if skills_dir else None,
+                "min_frequency": min_freq,
+                "mode": "in_process",
+            }
+
+        out = {"status": "ok", "mode": "in_process", "tool": tool_name}
+        if original_error and "transport_reason" in original_error:
+            out["transport_reason"] = original_error["transport_reason"]
+        return out

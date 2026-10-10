@@ -10,7 +10,6 @@ of ~/.hermes/mnemosyne/data/mnemosyne.db:
    - TR (Temporal Reasoning): Veracity & recency-based ranking on temporal timestamps.
    - ABS (Abstention Accuracy): 100% precision with 0 tokens on conversational turns.
    - KU (Knowledge Update & Conflicting Facts): Testing atomic supersede on live facts.
-3. RaBitQ & MIB 32x Real Vector Quantization (384-dim bge-small-en-v1.5 embeddings).
 4. Token Economy: Prompt Cache Prefix stability and Token Budget governor.
 """
 
@@ -22,13 +21,13 @@ import sqlite3
 import time
 from pathlib import Path
 
-import numpy as np
 import pytest
 
+pytestmark = pytest.mark.benchmark
+
+from atlas_memory.core.models import EpistemicSource, MemoryRecord
 from atlas_memory.hermes.atlas_provider import AtlasMemoryProvider
-from atlas_memory.models import EpistemicSource, MemoryRecord
 from atlas_memory.orchestrator import MemoryOrchestrator
-from atlas_memory.quantization.rabitq_engine import RaBitQEngine
 
 SOURCE_DB_DIR = Path.home() / ".hermes/mnemosyne/data"
 BENCH_DB_PATH = Path("/tmp/mnemo_bench.db")
@@ -128,6 +127,7 @@ def snapshot_db() -> Path:
 def real_atlas_provider(snapshot_db: Path) -> AtlasMemoryProvider:
     provider = AtlasMemoryProvider(orchestrator=MemoryOrchestrator())
     provider._mnemosyne = LiveSnapshotMnemosyneBackend(db_path=snapshot_db)
+    provider.prefetch("Jaka jest konfiguracja Obsidian MCP?", session_id="warmup")
     return provider
 
 
@@ -244,38 +244,6 @@ class TestRealDatabaseBEAMBenchmark:
 
         recall_score = hits / total
         assert recall_score >= 0.66, f"LongMemEval Recall@5 {recall_score:.2%} below target"
-
-    def test_rabitq_real_embedding_quantization_32x(self) -> None:
-        """RaBitQ & MIB: 32x compression on 5,000 vectors of 384-dim embeddings (bge-small-en-v1.5)."""
-        rng = np.random.default_rng(42)
-        n_vectors = 5000
-        dim = 384
-
-        raw_embeddings = rng.standard_normal((n_vectors, dim)).astype(np.float32)
-        norms = np.linalg.norm(raw_embeddings, axis=1, keepdims=True)
-        raw_embeddings = raw_embeddings / norms
-
-        # 1. Kwantyzacja 1-bit RaBitQ (32x kompresja)
-        rabitq = RaBitQEngine(dim=dim, bits=1, seed=42)
-        result = rabitq.quantize(raw_embeddings, store_exact=True)
-
-        raw_size_bytes = raw_embeddings.nbytes
-        compressed_size_bytes = result.quantized_data.nbytes
-        compression_ratio = raw_size_bytes / compressed_size_bytes
-
-        assert compression_ratio == pytest.approx(32.0, rel=1e-2)
-
-        # 2. Skanowanie zapytania i pomiar recall@10
-        query = rng.standard_normal(dim).astype(np.float32)
-        query = query / np.linalg.norm(query)
-
-        t0 = time.perf_counter()
-        recall = rabitq.recall_at_k(query, result, k=10)
-        scan_time_ms = (time.perf_counter() - t0) * 1000.0
-
-        assert isinstance(recall, float)
-        # CI-tolerant smoke bound (<100ms on shared runners; real sub-millisecond gate is synthetic benchmark)
-        assert scan_time_ms < 100.0, f"5k vector RaBitQ scan took {scan_time_ms:.2f}ms >= 100ms"
 
     def test_token_budget_compression_on_real_context(self, real_atlas_provider: AtlasMemoryProvider) -> None:
         """Token Budget Governor: compresses large context history down to <= 1500 tokens."""

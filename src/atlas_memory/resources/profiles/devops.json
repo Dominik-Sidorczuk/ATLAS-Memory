@@ -1,0 +1,88 @@
+{
+  "profile_name": "devops_infrastructure",
+  "version": "1.0.0",
+  "description": "DevOps, Cloud, Containerization and Infrastructure Tooling Profile",
+  "custom_predicates": {
+    "hosts": {
+      "transitive": false
+    },
+    "hosted_on": {
+      "transitive": false
+    },
+    "provides": {
+      "transitive": false
+    },
+    "protocol": {
+      "transitive": false
+    },
+    "listens_on": {
+      "transitive": false
+    }
+  },
+  "developer_tools": [
+    "git",
+    "python",
+    "pytest",
+    "bash",
+    "sh",
+    "zsh",
+    "npm",
+    "cargo",
+    "docker",
+    "pip",
+    "pixi",
+    "node",
+    "linux",
+    "sqlite",
+    "redis",
+    "postgres",
+    "postgresql",
+    "mysql",
+    "qdrant",
+    "kuzu",
+    "hermes",
+    "github",
+    "gitlab",
+    "conda",
+    "vscode",
+    "react",
+    "fastapi"
+  ],
+  "structural_rules": [
+    {
+      "pattern": "(?:listens on|nasłuchuje na)\\s+([A-Za-z0-9_.:]+)",
+      "parent_template": "{subject}",
+      "rel_label": "listens_on"
+    }
+  ],
+  "entities": [
+    {
+      "canonical_id": "entity_nas_01",
+      "canonical_name": "TrueNAS Server",
+      "aliases": [
+        "mój nas",
+        "nas",
+        "truenas",
+        "advantech",
+        "serwer plików",
+        "home nas"
+      ],
+      "entity_type": "hardware_server",
+      "description": "Lokalny serwer plików NAS TrueNAS na maszynie Advantech"
+    },
+    {
+      "canonical_id": "entity_agent_core",
+      "canonical_name": "Hermes Agent",
+      "aliases": [
+        "hermes",
+        "hermes agent",
+        "asystent",
+        "mój agent",
+        "agent core"
+      ],
+      "entity_type": "software_agent",
+      "description": "Rdzeń autonomicznego agenta Hermes"
+    }
+  ]
+}
+

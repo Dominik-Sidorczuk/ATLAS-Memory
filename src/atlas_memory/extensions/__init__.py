@@ -3,7 +3,6 @@ from __future__ import annotations
 from atlas_memory.extensions.canonicalizer import EntityCanonicalizer, EntityEntry
 from atlas_memory.extensions.compactor import CompactionLevel, ContextCompactor
 from atlas_memory.extensions.decay_scorer import SalienceDecayEngine
-from atlas_memory.extensions.epistemic import EpistemicCalibrator
 
 __all__ = [
     "SalienceDecayEngine",
@@ -11,6 +10,5 @@ __all__ = [
     "EntityEntry",
     "ContextCompactor",
     "CompactionLevel",
-    "EpistemicCalibrator",
 ]
 

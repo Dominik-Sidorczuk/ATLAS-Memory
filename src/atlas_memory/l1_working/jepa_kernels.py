@@ -2,16 +2,7 @@ from __future__ import annotations
 
 import numpy as np
 
-try:
-    from numba import njit
-    HAS_NUMBA = True
-except ImportError:
-    HAS_NUMBA = False
-
-    def njit(*args, **kwargs):
-        def decorator(func):
-            return func
-        return decorator
+from atlas_memory.l0_dynamic.ttt_kernels import njit
 
 
 @njit(fastmath=True, nogil=True)
@@ -55,45 +46,52 @@ def numba_jepa_step(
 
 
 @njit(fastmath=True, nogil=True)
-def numba_jepa_rollout(
-    s_0: np.ndarray,
-    actions_mat: np.ndarray,
+def numba_jepa_adapt_step(
+    s_t: np.ndarray,
+    a_t: np.ndarray,
+    target_s_next: np.ndarray,
     w_s: np.ndarray,
     w_a: np.ndarray,
     bias: np.ndarray,
-    w_val: np.ndarray,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    lr: float,
+    weight_decay: float,
+) -> float:
     """
-    Wielokrokowa symulacja myślowa (System 2 Rollout) w jednej skompilowanej pętli C.
-    Zoptymalizowana pod kątem in-place zapisu stanów trajektorii bez alokacji pośrednich.
+    Krok adaptacji online wag JEPA (w_s, w_a, bias) gradientem straty rekonstrukcji
+    predykowanego stanu względem obserwowanego target_s_next:
+    L = 1/D * ||tanh(s_t @ w_s + a_t @ w_a + bias) - target_s_next||^2
     """
-    n_steps = actions_mat.shape[0]
-    state_dim = s_0.shape[1]
-    a_dim = actions_mat.shape[1]
+    s_dim = s_t.shape[1]
+    a_dim = a_t.shape[1]
+    n_cols = w_s.shape[1]
 
-    trajectory_states = np.empty((n_steps, state_dim), dtype=np.float64)
-    trajectory_rewards = np.empty(n_steps, dtype=np.float64)
-    trajectory_uncertainties = np.empty(n_steps, dtype=np.float64)
+    loss = 0.0
+    factor = 2.0 / n_cols if n_cols > 0 else 0.0
 
-    prev_s = s_0
-    for i in range(n_steps):
-        a_i = actions_mat[i : i + 1]
-        sq_sum = 0.0
-        sim_reward = 0.0
-        for j in range(state_dim):
-            raw = bias[0, j]
-            for p in range(state_dim):
-                raw += prev_s[0, p] * w_s[p, j]
-            for p in range(a_dim):
-                raw += a_i[0, p] * w_a[p, j]
+    grad_z = np.empty((1, n_cols), dtype=np.float64)
 
-            val = np.tanh(raw)
-            trajectory_states[i, j] = val
-            sq_sum += val * val
-            sim_reward += val * w_val[j, 0]
+    for j in range(n_cols):
+        raw = bias[0, j]
+        for p in range(s_dim):
+            raw += s_t[0, p] * w_s[p, j]
+        for p in range(a_dim):
+            raw += a_t[0, p] * w_a[p, j]
 
-        trajectory_rewards[i] = sim_reward
-        trajectory_uncertainties[i] = 1.0 - (sq_sum / state_dim) if state_dim > 0 else 1.0
-        prev_s = trajectory_states[i : i + 1]
+        pred_val = np.tanh(raw)
+        diff = pred_val - target_s_next[0, j]
+        loss += diff * diff
+        grad_z[0, j] = factor * diff * (1.0 - pred_val * pred_val)
 
-    return trajectory_states, trajectory_rewards, trajectory_uncertainties
+    loss = loss / n_cols if n_cols > 0 else 0.0
+
+    # Aktualizacja in-place z weight decay
+    for j in range(n_cols):
+        gz = grad_z[0, j]
+        bias[0, j] -= lr * gz
+        for p in range(s_dim):
+            w_s[p, j] -= lr * (s_t[0, p] * gz + weight_decay * w_s[p, j])
+        for p in range(a_dim):
+            w_a[p, j] -= lr * (a_t[0, p] * gz + weight_decay * w_a[p, j])
+
+    return loss
+

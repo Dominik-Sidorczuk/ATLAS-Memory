@@ -1,9 +1,11 @@
 # Środowiska i cache pakietów
 .venv/
+.pixi
 .pixi/
 *.egg-info/
 dist/
 build/
+.vscode/
 
 # Cache Pythona i testów
 __pycache__/
@@ -29,6 +31,7 @@ data/
 
 # Internal agent-workflow governance (private, not published)
 loop-internal/
+raports/
 *.zip
 
 
@@ -43,6 +46,19 @@ skills/goal-verifier
 
 # Internal technical docs with private milestone narrative (V2 prep, 2026-09-08)
 docs/adr/
-docs/baselines/
+# V88b/T8: docs/baselines/ NIE jest już ignorowany — testy kontraktowe
+# (tests/contract/test_calibration_contract.py) zależą od JSON-owych baseline'ów,
+# a nieśledzony katalog = proweniencja, której nie da się odtworzyć z clone'u.
 docs/research/
 docs/walkthrough.md
+# V97/V103: docs/calib/ = artefakty runtime runnera kalibracji (:3058)
+docs/calib/
+
+
+.worktrees/
+.kilo/
+
+# V3.0 release hygiene: coding-agent internal files, sanitization artifacts
+.hermes/
+scripts/sanitize_*.py
+scripts/purge_targets_*.json

@@ -120,12 +120,9 @@ async def test_3_real_multi_turn_with_adapter():
     print("TEST 3: Adapter z 10 turami (cache monitoring)")
     print("="*70)
 
-    from atlas_memory import HermesMemoryAdapter
+    from atlas_memory import MemoryOrchestrator
 
-    adapter = HermesMemoryAdapter.create_default(
-        omniroute_api_base=API_BASE,
-        omniroute_model=MODEL_CHEAP,
-    )
+    orchestrator = MemoryOrchestrator()
 
     turns = [
         "Cześć, jak się masz?",
@@ -141,35 +138,28 @@ async def test_3_real_multi_turn_with_adapter():
     ]
 
     for i, turn in enumerate(turns, 1):
-        res = await adapter.orchestrated_search(turn)
+        res = await orchestrator.orchestrated_search(turn)
         skipped = res.get("retrieval_skipped", False)
-        prefix = adapter.get_cache_prefix({"user": "Dominik"}, ["Rule: be helpful"], model_name=MODEL_CHEAP)
-        print(f"  Tura {i}: '{turn[:40]}...' → {'SKIP' if skipped else 'RETRIEVE'} | prefix_hash={prefix[:16]}...")
+        print(f"  Tura {i}: '{turn[:40]}...' → {'SKIP' if skipped else 'RETRIEVE'}")
 
-    report = adapter.get_telemetry_report()
+    report = {
+        "orchestrator_stats": orchestrator.get_stats(),
+    }
+    processed_turns = report["orchestrator_stats"].get("total_turns", 0)
     print("\n✅ Telemetry report:")
-    print(f"   Cache stats: {report['cache_stats']}")
     print(f"   Orchestrator stats: {report['orchestrator_stats']}")
-    print(f"   Active sensing errors: {report['active_sensing_errors_count']}")
-
-    # Sprawdź że cache monitoring działa (klucze z CacheHitMonitor.monthly_report)
-    cache_stats = report["cache_stats"]
-    total_turns = cache_stats.get("total_monitored_turns", 0)
-    hit_rate = cache_stats.get("overall_cache_hit_rate_pct", 0.0)
-    tokens_saved = cache_stats.get("total_tokens_saved", 0)
-    print(f"\n✅ Cache monitoring: | hit_rate={hit_rate}% | tokens_saved={tokens_saved} | turns={total_turns}")
-    return total_turns >= 10 and hit_rate >= 40.0
+    return processed_turns >= 10
 
 
 async def test_4_real_veracity_arbitration():
-    """T4: Realna arbitracja veracity z adapterem (USER_EXPLICIT > AGENT_INFERENCE)."""
+    """T4: Realna arbitracja veracity (USER_EXPLICIT > AGENT_INFERENCE)."""
     print("\n" + "="*70)
     print("TEST 4: Realna arbitracja veracity (USER_EXPLICIT > AGENT_INFERENCE)")
     print("="*70)
 
-    from atlas_memory import EpistemicSource, HermesMemoryAdapter, MemoryRecord
+    from atlas_memory import EpistemicSource, MemoryOrchestrator, MemoryRecord
 
-    adapter = HermesMemoryAdapter.create_default()
+    orchestrator = MemoryOrchestrator()
 
     # Symuluj konflikt
     old_infer = MemoryRecord(
@@ -183,7 +173,7 @@ async def test_4_real_veracity_arbitration():
         timestamp=time.time(),
     )
 
-    ranked = adapter.orchestrator.epistemic_rank([old_infer, new_user], query="cluster status")
+    ranked = orchestrator.epistemic_rank([old_infer, new_user], query="cluster status")
     top_source = ranked[0][0].source_type
     top_score = ranked[0][1]
     bottom_source = ranked[1][0].source_type

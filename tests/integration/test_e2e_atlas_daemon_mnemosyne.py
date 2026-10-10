@@ -7,15 +7,16 @@ from pathlib import Path
 import pytest
 
 from atlas_memory.hermes.atlas_provider import AtlasMemoryProvider
+from atlas_memory.ipc.uds_client import AtlasDaemonClient
 from atlas_memory.server.atlas_daemon import AtlasDaemon
-from atlas_memory.server.client import AtlasDaemonClient
 
 
 @pytest.mark.asyncio
-async def test_mnemosyne_ingestion_and_daemon_rpc(tmp_path: Path):
-    sock_path = tmp_path / "test_atlas.sock"
-    pid_path = tmp_path / "test_atlas.pid"
+async def test_mnemosyne_ingestion_and_daemon_rpc(tmp_path: Path, uds_dir: Path):
+    sock_path = uds_dir / "test_atlas.sock"
+    pid_path = uds_dir / "test_atlas.pid"
     atlas_dir = tmp_path / "atlas_vault"
+    assert len(str(sock_path)) < 100, f"ścieżka testowego socketa UDS za długa: {sock_path}"
 
     daemon = AtlasDaemon.create_default(
         socket_path=sock_path,
@@ -63,15 +64,4 @@ async def test_mnemosyne_ingestion_and_daemon_rpc(tmp_path: Path):
     finally:
         await daemon.stop()
 
-
-def test_sync_legacy_mnemosyne_deprecated_kwarg(tmp_path: Path):
-    """Verifies that using sync_legacy_mnemosyne triggers a DeprecationWarning and sets the flag."""
-    with pytest.deprecated_call():
-        daemon = AtlasDaemon.create_default(
-            socket_path=tmp_path / "test.sock",
-            pid_path=tmp_path / "test.pid",
-            atlas_dir=tmp_path / "atlas",
-            sync_legacy_mnemosyne=False,
-        )
-    assert daemon is not None
 

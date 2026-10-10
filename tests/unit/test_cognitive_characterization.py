@@ -26,10 +26,10 @@ from pathlib import Path
 import pytest
 
 from atlas_memory.cognitive.conflict_arbiter import ConflictArbiter
-from atlas_memory.cognitive.hot_buffer import HotBufferPolicy
-from atlas_memory.cognitive.retrieval_pipeline import RetrievalPipeline
+from atlas_memory.cognitive.retrieval.pipeline import RetrievalPipeline
 from atlas_memory.cognitive.write_path import EpistemicWritePath
 from atlas_memory.engine import HybridMemoryEngine
+from atlas_memory.l1_working.hot_buffer import HotBufferPolicy
 
 
 class MockGraphStore:
@@ -133,9 +133,9 @@ GOLDEN_TRUE_POSITIVES = [
     # TP 10: Polarity contradiction on commit author identity
     (
         "rule:commit:identity",
-        "Zawsze używaj autora Dominik <dom3lsidor@gmail.com>",
+        "Zawsze używaj autora Dominik <author@atlas-memory.org>",
         "rule:commit:identity_alt",
-        "Zakaz używania autora Dominik <dom3lsidor@gmail.com>",
+        "Zakaz używania autora Dominik <author@atlas-memory.org>",
         "prohibition_contradiction",
     ),
 ]

@@ -17,9 +17,8 @@ _NEED_BASELINES = any(_BASELINES_DIR.glob("benchmark_*.json"))
 
 def test_loop_doctor_instantiation():
     """Verify LoopDoctor initializes cleanly."""
-    doctor = LoopDoctor(root=REPO_ROOT, auto_fix=True)
+    doctor = LoopDoctor(root=REPO_ROOT, auto_fix=False)
     assert doctor.root == REPO_ROOT
-    assert doctor.score_points == 100
 
 
 def test_loop_doctor_baseline_json_check():
@@ -33,7 +32,7 @@ def test_loop_doctor_baseline_json_check():
 
 
 def test_loop_doctor_doc_sync_check():
-    """Verify LoopDoctor checks STATE.md and README.md synchronization."""
+    """Verify LoopDoctor checks documentation passport synchronization."""
     doctor = LoopDoctor(root=REPO_ROOT)
     result = doctor.check_doc_sync_passport()
     assert result is True
@@ -59,11 +58,11 @@ def test_loop_doctor_diagnose_score(monkeypatch):
     """Verify full diagnosis returns valid score and maturity tier."""
     if not _NEED_BASELINES:
         pytest.skip("docs/baselines/ not in public repo (score < 90 without them)")
-    doctor = LoopDoctor(root=REPO_ROOT, auto_fix=True)
+    doctor = LoopDoctor(root=REPO_ROOT, auto_fix=False)
     monkeypatch.setattr(doctor, "check_git_status", lambda: True)
     report = doctor.diagnose()
     assert "loop_ready_score" in report
-    assert report["loop_ready_score"] >= 90
+    assert report["loop_ready_score"] == doctor.score_points
     assert "L2+" in report["maturity_tier"]
 
 

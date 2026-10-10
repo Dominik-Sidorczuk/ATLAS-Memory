@@ -6,10 +6,10 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from atlas_memory.arrow_buffer.trajectory_buffer import ArrowTrajectoryBuffer
+from atlas_memory.core.models import ActionPlan, LatentState, PredictedTransition
 from atlas_memory.l0_dynamic.ttt_layer import TTTLayer
+from atlas_memory.l1_working.trajectory_buffer import ArrowTrajectoryBuffer
 from atlas_memory.l2_semantic.kv_store import VerifiedKVStore
-from atlas_memory.models import ActionPlan, LatentState, PredictedTransition
 
 
 def _create_sample_transition(step: int, dim: int = 16) -> PredictedTransition:

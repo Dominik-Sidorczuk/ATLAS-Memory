@@ -1,17 +1,40 @@
 from __future__ import annotations
 
 import asyncio
-import contextlib
 import hashlib
 import json
 import logging
 import sqlite3
 import threading
 import time
-from typing import Any, Dict, List, Optional, Tuple
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 
 from atlas_memory.cognitive.models import clamp_conf
-from atlas_memory.models import MemoryRecord
+from atlas_memory.core.exceptions import InvariantViolation
+from atlas_memory.core.models import MemoryRecord
+from atlas_memory.l2_semantic.repositories import (
+    L0_STEP_COUNTER_TABLE,
+    L0_TTT_COUNTER_NAME,
+    REDACTION_LEGACY_REASON,
+    REDACTION_MARKER_PREFIX,
+    REDACTION_REGISTRY_TABLE,
+    L0StepCounterRepository,
+    Sha256AuditLedgerRepository,
+    SleepCheckpointRepository,
+    SqliteConnectionManager,
+    SqliteStateRepository,
+    TransactionIntentRepository,
+)
+
+__all__ = [
+    "VerifiedKVStore",
+    "REDACTION_MARKER_PREFIX",
+    "REDACTION_REGISTRY_TABLE",
+    "REDACTION_LEGACY_REASON",
+    "L0_STEP_COUNTER_TABLE",
+    "L0_TTT_COUNTER_NAME",
+]
 
 logger = logging.getLogger("atlas.l2.kv_store")
 
@@ -20,14 +43,33 @@ class VerifiedKVStore:
     """
     L2: Verified Key-Value / SQL Store (SQLite / JSONB) z obsługą transakcji Saga / 2PC
     oraz kryptograficznym SHA-256 Hash-Chain Audit Log (Source of Truth & Immutability).
+
+    Refactored to Clean Architecture / Facade coordinating dedicated repositories:
+    - SqliteConnectionManager: connection lifecycle, pragmas, WAL checkpoints, online backup.
+    - SqliteStateRepository: key-value storage, FTS5 indexing, candidate queries.
+    - Sha256AuditLedgerRepository: SHA-256 hash-chain audit log, verification, redactions.
+    - TransactionIntentRepository: distributed Saga/2PC intent log.
+    - SleepCheckpointRepository: sleep consolidation checkpoints.
+    - L0StepCounterRepository: persistent monotonic step counters for L0-TTT.
     """
 
-    def __init__(self, db_path: str = ":memory:"):
+    def __init__(self, db_path: str = ":memory:", audit_db_path: Optional[str] = None):
         self.db_path = db_path
+        self._audit_db_path_override = audit_db_path
+        self.audit_db_path: Optional[str] = None
         self._lock = asyncio.Lock()
         self._sync_lock = threading.RLock()
         self._conn: Optional[sqlite3.Connection] = None
         self._prev_hash: str = "0" * 64
+        self._audit_cols: Set[str] = set()
+
+        self._connection_mgr = SqliteConnectionManager()
+        self._state_repo = SqliteStateRepository()
+        self._audit_repo = Sha256AuditLedgerRepository()
+        self._tx_repo = TransactionIntentRepository()
+        self._checkpoint_repo = SleepCheckpointRepository()
+        self._l0_repo = L0StepCounterRepository()
+
         self._init_db()
 
     def _ensure_conn(self) -> sqlite3.Connection:
@@ -36,109 +78,53 @@ class VerifiedKVStore:
             raise RuntimeError("VerifiedKVStore database connection is closed.")
         return self._conn
 
+    def ensure_connection(self) -> sqlite3.Connection:
+        """V113 (F-029-class): public invariant guard replacing the private `assert kv._conn is not None`.
+
+        Returns the live sqlite3 connection (which supports the `with` context-manager
+        protocol so callers can do `with kv.ensure_connection() as conn:` instead of
+        touching the private `_conn` attribute).
+        """
+        if self._conn is None:
+            raise InvariantViolation(
+                module="l2_semantic.kv_store",
+                name="kv_connection_open",
+                observed=0,
+                expected=1,
+                hint=(
+                    "VerifiedKVStore connection is closed; do not write to a dead "
+                    "handle. Reopen the store (delete_state or new VerifiedKVStore) "
+                    "instead of bypassing the public API."
+                ),
+            )
+        return self._conn
+
     @staticmethod
     def _compute_entry_hash(seq: int, timestamp: float, key: str, value_hash: str, prev_hash: str) -> str:
         """Deterministyczne obliczanie hasza węzła łańcucha audytu SHA-256."""
-        payload_str = f"{seq}:{timestamp}:{key}:{value_hash}:{prev_hash}"
-        return hashlib.sha256(payload_str.encode("utf-8")).hexdigest()
+        return Sha256AuditLedgerRepository.compute_entry_hash(seq, timestamp, key, value_hash, prev_hash)
 
     @staticmethod
     def _row_to_state_dict(row: sqlite3.Row) -> Dict[str, Any]:
-        """Konwertuje wiersz tabeli state_variables do ujednoliconego słownika stanu."""
-        val = row["value"]
-        if isinstance(val, str):
-            try:
-                val = json.loads(val)
-            except Exception:
-                val = row["value"]
-
-        meta = row["metadata"]
-        if isinstance(meta, str):
-            try:
-                parsed_meta = json.loads(meta) if meta else {}
-                meta = parsed_meta if isinstance(parsed_meta, dict) else {}
-            except Exception:
-                meta = {}
-        elif not isinstance(meta, dict):
-            meta = {}
-
-        return {
-            "key": row["key"],
-            "value": val,
-            "confidence": row["confidence"],
-            "timestamp": row["timestamp"],
-            "metadata": meta,
-        }
+        """Konwertuje wiersz tabeli state_variables do ujednoliconego słownika stanu z kwarantanną i weryfikacją tamperingu."""
+        return SqliteStateRepository.row_to_state_dict(row, json_loads=json.loads)
 
     def _init_db(self) -> None:
-        self._conn = sqlite3.connect(self.db_path, check_same_thread=False)
-        self._conn.row_factory = sqlite3.Row
-        # Włączenie trybu WAL i zoptymalizowanych flag I/O poza transakcją
-        self._conn.execute("PRAGMA journal_mode=WAL;")
-        self._conn.execute("PRAGMA synchronous=NORMAL;")
-        self._conn.execute("PRAGMA temp_store=MEMORY;")
-        self._conn.execute("PRAGMA cache_size=-64000;")
-
+        self._conn, self.audit_db_path, target_audit = self._connection_mgr.connect(
+            db_path=self.db_path,
+            audit_db_path_override=self._audit_db_path_override,
+        )
         with self._conn:
-            self._conn.execute("""
-                CREATE TABLE IF NOT EXISTS state_variables (
-                    key TEXT PRIMARY KEY,
-                    value TEXT NOT NULL,
-                    confidence REAL NOT NULL,
-                    timestamp REAL NOT NULL,
-                    metadata TEXT
-                )
-            """)
-            # Tabela SHA-256 Hash-Chain Audit Log
-            self._conn.execute("""
-                CREATE TABLE IF NOT EXISTS state_audit_log (
-                    seq INTEGER PRIMARY KEY AUTOINCREMENT,
-                    timestamp REAL NOT NULL,
-                    key TEXT NOT NULL,
-                    value_hash TEXT NOT NULL,
-                    prev_hash TEXT NOT NULL,
-                    entry_hash TEXT NOT NULL,
-                    new_value TEXT,
-                    confidence REAL DEFAULT 1.0,
-                    reason TEXT DEFAULT 'update'
-                )
-            """)
-            # Tabela intencji transakcyjnych dla wzorca Saga (zapobieganie split-brain state)
-            self._conn.execute("""
-                CREATE TABLE IF NOT EXISTS transaction_intent_log (
-                    tx_id TEXT PRIMARY KEY,
-                    subject TEXT NOT NULL,
-                    predicate TEXT NOT NULL,
-                    object TEXT NOT NULL,
-                    status TEXT NOT NULL, -- PENDING, COMMITTED, COMPENSATING, FAILED
-                    timestamp REAL NOT NULL,
-                    error TEXT
-                )
-            """)
-
-            with contextlib.closing(self._conn.cursor()) as cursor:
-                # Sprawdź dostępne kolumny w state_audit_log i dodaj brakujące
-                cursor.execute("PRAGMA table_info(state_audit_log)")
-                self._audit_cols = {row["name"] for row in cursor.fetchall()}
-                for col_name, col_def in (
-                    ("new_value", "TEXT"),
-                    ("confidence", "REAL DEFAULT 1.0"),
-                    ("reason", "TEXT DEFAULT 'update'"),
-                ):
-                    if col_name not in self._audit_cols:
-                        try:
-                            cursor.execute(f"ALTER TABLE state_audit_log ADD COLUMN {col_name} {col_def}")
-                            self._audit_cols.add(col_name)
-                        except Exception:
-                            pass
-
-                # Inicjalizacja _prev_hash na podstawie ostatniego wpisu w bazie (jeśli istnieje)
-                cursor.execute("SELECT entry_hash FROM state_audit_log ORDER BY seq DESC LIMIT 1")
-                row = cursor.fetchone()
-                if row and row["entry_hash"]:
-                    self._prev_hash = row["entry_hash"]
-                else:
-                    self._prev_hash = "0" * 64
+            self._state_repo.init_schema(self._conn)
+            self._audit_cols, self._prev_hash = self._audit_repo.init_schema(
+                conn=self._conn,
+                db_path=self.db_path,
+                audit_db_path=self.audit_db_path,
+                target_audit=target_audit,
+            )
+            self._tx_repo.init_schema(self._conn)
+            self._checkpoint_repo.init_schema(self._conn)
+            self._l0_repo.init_schema(self._conn)
 
     def _insert_audit_entry_sync(
         self,
@@ -154,174 +140,121 @@ class VerifiedKVStore:
         reason: str = "update",
     ) -> None:
         """Wstawia wpis do audit logu z zachowaniem zgodności wstecznej schematu."""
-        if "new_value" in getattr(self, "_audit_cols", set()):
-            cursor.execute("""
-                INSERT INTO state_audit_log (seq, timestamp, key, value_hash, prev_hash, entry_hash, new_value, confidence, reason)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """, (seq, timestamp, key, val_hash, prev_h, entry_hash, val_json, confidence, reason))
-        else:
-            cursor.execute("""
-                INSERT INTO state_audit_log (seq, timestamp, key, value_hash, prev_hash, entry_hash)
-                VALUES (?, ?, ?, ?, ?, ?)
-            """, (seq, timestamp, key, val_hash, prev_h, entry_hash))
+        self._audit_repo.insert_audit_entry(
+            conn=cursor,
+            audit_cols=getattr(self, "_audit_cols", set()),
+            seq=seq,
+            timestamp=timestamp,
+            key=key,
+            val_hash=val_hash,
+            prev_h=prev_h,
+            entry_hash=entry_hash,
+            val_json=val_json,
+            confidence=confidence,
+            reason=reason,
+        )
 
-    async def append_audit_log(self, entry: Dict[str, Any]) -> str:
-        """
-        Dołącza nowy wpis do kryptograficznego SHA-256 Hash-Chain.
-        entry_hash = SHA-256(seq + timestamp + key + value_hash + prev_hash)
-        """
-        async with self._lock:
-            conn = self._ensure_conn()
-            with conn:
-                with contextlib.closing(conn.cursor()) as cursor:
-                    # Pobierz kolejny seq
-                    cursor.execute("SELECT IFNULL(MAX(seq), 0) + 1 AS next_seq FROM state_audit_log")
-                    next_seq = cursor.fetchone()["next_seq"]
+    def _redaction_is_authorized(self, conn: sqlite3.Connection, seq: int, key: str, value_hash: str) -> bool:
+        """V87 (T1) / ADR-008: czy redakcja wpisu seq ma wpis w rejestrze audytu."""
+        return self._audit_repo.redaction_is_authorized(conn, seq, key, value_hash)
 
-                    now = float(entry.get("timestamp", time.time()))
-                    key = str(entry.get("key", ""))
-                    raw_val = entry.get("value")
-                    if "value_hash" in entry:
-                        value_hash = str(entry["value_hash"])
-                    else:
-                        val_bytes = json.dumps(raw_val, sort_keys=True).encode("utf-8") if raw_val is not None else b""
-                        value_hash = hashlib.sha256(val_bytes).hexdigest()
-
-                    prev_h = self._prev_hash
-                    entry_hash = self._compute_entry_hash(next_seq, now, key, value_hash, prev_h)
-
-                    cursor.execute("""
-                        INSERT INTO state_audit_log (seq, timestamp, key, value_hash, prev_hash, entry_hash)
-                        VALUES (?, ?, ?, ?, ?, ?)
-                    """, (next_seq, now, key, value_hash, prev_h, entry_hash))
-
-            self._prev_hash = entry_hash
-            return entry_hash
-
-    def verify_audit_log_sync(self, deep: bool = False) -> Tuple[bool, int]:
-        """
-        Synchronous version of verify_audit_log.
-        Weryfikuje kryptograficzną integralność całego łańcucha audytu SHA-256 bez pętli asynchronicznej.
-        Gdy deep=True, weryfikuje również czy value_hash odpowiada sha256(new_value).
-        Zwraca (is_valid, broken_at_seq). Jeśli wszystko poprawne: (True, 0).
-        """
+    def authorize_redaction(
+        self,
+        seq: int,
+        key: str,
+        value_hash: str,
+        reason: str = REDACTION_LEGACY_REASON,
+    ) -> Dict[str, Any]:
+        """V87 (T1) / ADR-008: publiczne API rejestrowania redakcji w audit_redactions."""
         with self._sync_lock:
             conn = self._ensure_conn()
-            with contextlib.closing(conn.cursor()) as cursor:
-                cols = getattr(self, "_audit_cols", set())
-                if "new_value" in cols:
-                    cursor.execute(
-                        "SELECT seq, timestamp, key, value_hash, prev_hash, entry_hash, new_value "
-                        "FROM state_audit_log ORDER BY seq ASC"
+            with conn:
+                return self._audit_repo.authorize_redaction(conn, seq, key, value_hash, reason)
+
+    def redact_audit_entry(
+        self,
+        seq: int,
+        reason: str = "SEC-001",
+        redacted_value: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Autoryzowana redakcja TREŚCI wpisu audytu (V87/T1, ADR-008)."""
+        with self._sync_lock:
+            conn = self._ensure_conn()
+            return self._audit_repo.redact_audit_entry(conn, seq, reason, redacted_value)
+
+    def save_l0_step_counter(self, step_count: int, total_energy: float = 0.0) -> None:
+        """Zapisuje (monotonicznie) trwały licznik kroków adaptacji L0-TTT (V87/T3)."""
+        with self._sync_lock:
+            conn = self._ensure_conn()
+            with conn:
+                self._l0_repo.save_step_counter(conn, step_count, total_energy)
+
+    def load_l0_step_counter(self) -> Optional[Dict[str, Any]]:
+        """Zwraca ostatni trwały stan licznika L0-TTT albo None (brak wpisu/błędy)."""
+        with self._sync_lock:
+            conn = self._ensure_conn()
+            return self._l0_repo.load_step_counter(conn)
+
+    async def append_audit_log(self, entry: Dict[str, Any]) -> str:
+        """Dołącza nowy wpis do kryptograficznego SHA-256 Hash-Chain."""
+        async with self._lock:
+            with self._sync_lock:
+                conn = self._ensure_conn()
+                with conn:
+                    entry_hash = self._audit_repo.append_audit_log(
+                        conn=conn,
+                        audit_cols=getattr(self, "_audit_cols", set()),
+                        entry=entry,
                     )
-                else:
-                    cursor.execute(
-                        "SELECT seq, timestamp, key, value_hash, prev_hash, entry_hash "
-                        "FROM state_audit_log ORDER BY seq ASC"
-                    )
-                rows = cursor.fetchall()
+                self._prev_hash = entry_hash
+                return entry_hash
 
-            expected_prev = "0" * 64
-            for row in rows:
-                seq = row["seq"]
-                ts = row["timestamp"]
-                key = row["key"]
-                val_h = row["value_hash"]
-                prev_h = row["prev_hash"]
-                stored_entry_h = row["entry_hash"]
-
-                if prev_h != expected_prev:
-                    return False, seq
-
-                if deep and "new_value" in cols and row["new_value"] is not None:
-                    calc_val_h = hashlib.sha256(str(row["new_value"]).encode("utf-8")).hexdigest()
-                    if calc_val_h != val_h:
-                        return False, seq
-
-                computed_h = self._compute_entry_hash(seq, ts, key, val_h, prev_h)
-                if computed_h != stored_entry_h:
-                    return False, seq
-
-                expected_prev = stored_entry_h
-
-            if rows:
-                self._prev_hash = expected_prev
-
-            return True, 0
+    def verify_audit_log_sync(self, deep: bool = True) -> Tuple[bool, int]:
+        """Synchronous verification of SHA-256 hash-chain and F-10 cross-table consistency."""
+        with self._sync_lock:
+            conn = self._ensure_conn()
+            cols = getattr(self, "_audit_cols", set())
+            is_valid, broken_seq, last_hash = self._audit_repo.verify_audit_log(
+                conn=conn,
+                audit_cols=cols,
+                deep=deep,
+            )
+            if is_valid and last_hash != "0" * 64:
+                self._prev_hash = last_hash
+            return is_valid, broken_seq
 
     def verify_chain_integrity_sync(self) -> Tuple[bool, int]:
-        """Synchronous alias delegujący do verify_audit_log_sync()."""
+        """Synchronous alias delegujący do verify_audit_log_sync(deep=False)."""
         return self.verify_audit_log_sync(deep=False)
 
-    async def verify_audit_log(self, deep: bool = False) -> Tuple[bool, int]:
-        """
-        Weryfikuje kryptograficzną integralność całego łańcucha audytu SHA-256.
-        Gdy deep=True, weryfikuje również czy value_hash odpowiada sha256(new_value).
-        Zwraca (is_valid, broken_at_seq). Jeśli wszystko poprawne: (True, 0).
-        """
+    async def verify_audit_log(self, deep: bool = True) -> Tuple[bool, int]:
+        """Weryfikuje kryptograficzną integralność całego łańcucha audytu SHA-256."""
         async with self._lock:
             return self.verify_audit_log_sync(deep=deep)
 
     async def verify_chain_integrity(self) -> Tuple[bool, int]:
-        """Alias delegujący do verify_audit_log()."""
+        """Alias delegujący do verify_audit_log(deep=False)."""
         return await self.verify_audit_log(deep=False)
 
-    async def verify_audit_log_chain(self, deep: bool = False) -> Tuple[bool, int]:
+    async def verify_audit_log_chain(self, deep: bool = True) -> Tuple[bool, int]:
         """Alias delegujący do verify_audit_log()."""
         return await self.verify_audit_log(deep=deep)
 
-    def verify_audit_log_chain_sync(self, deep: bool = False) -> Tuple[bool, int]:
+    def verify_audit_log_chain_sync(self, deep: bool = True) -> Tuple[bool, int]:
         """Synchronous alias delegujący do verify_audit_log_sync()."""
         return self.verify_audit_log_sync(deep=deep)
 
     def heal_audit_log_chain(self) -> Tuple[int, bool]:
-        """
-        Synchronously heals cryptographic hash-chain integrity of state_audit_log
-        and clamps confidence values to [0.0, 1.0].
-        Returns (repaired_rows_count, True).
-        """
+        """Synchronously heal SHA-256 hash-chain integrity and clamp confidence values."""
         with self._sync_lock:
             conn = self._ensure_conn()
             cols = getattr(self, "_audit_cols", set())
-            has_confidence = "confidence" in cols
-            with conn:
-                with contextlib.closing(conn.cursor()) as cursor:
-                    if has_confidence:
-                        cursor.execute("SELECT seq, timestamp, key, value_hash, confidence FROM state_audit_log ORDER BY seq ASC")
-                    else:
-                        cursor.execute("SELECT seq, timestamp, key, value_hash FROM state_audit_log ORDER BY seq ASC")
-                    rows = cursor.fetchall()
-
-                    expected_prev = "0" * 64
-                    for row in rows:
-                        seq = row["seq"]
-                        ts = row["timestamp"]
-                        key = row["key"]
-                        val_h = row["value_hash"]
-                        prev_h = expected_prev
-                        entry_h = self._compute_entry_hash(seq, ts, key, val_h, prev_h)
-                        if has_confidence:
-                            conf = clamp_conf(row["confidence"])
-                            cursor.execute(
-                                "UPDATE state_audit_log SET prev_hash = ?, entry_hash = ?, confidence = ? WHERE seq = ?",
-                                (prev_h, entry_h, conf, seq),
-                            )
-                        else:
-                            cursor.execute(
-                                "UPDATE state_audit_log SET prev_hash = ?, entry_hash = ? WHERE seq = ?",
-                                (prev_h, entry_h, seq),
-                            )
-                        expected_prev = entry_h
-
-                    # Also clamp confidence in state_variables if present
-                    try:
-                        cursor.execute("UPDATE state_variables SET confidence = 1.0 WHERE confidence > 1.0")
-                        cursor.execute("UPDATE state_variables SET confidence = 0.0 WHERE confidence < 0.0")
-                    except Exception as e:
-                        logger.debug("Clamping state_variables confidence warning: %s", e)
-
-            self._prev_hash = expected_prev
-            return len(rows), True
+            count, ok, last_hash = self._audit_repo.heal_audit_log_chain(
+                conn=conn,
+                audit_cols=cols,
+            )
+            self._prev_hash = last_hash
+            return count, ok
 
     async def heal_audit_log(self) -> Tuple[int, bool]:
         """Async alias for heal_audit_log_chain."""
@@ -330,20 +263,12 @@ class VerifiedKVStore:
 
     def purge_stale_probe_keys(self, prefixes: Optional[List[str]] = None) -> int:
         """Purges test / probe keys from state_variables."""
-        if prefixes is None:
-            prefixes = ["huge:value", "test:adv:%", "knapsack:%"]
+        if not prefixes:
+            raise ValueError("prefixes list must be explicitly provided to purge_stale_probe_keys")
         with self._sync_lock:
             conn = self._ensure_conn()
-            total_deleted = 0
             with conn:
-                with contextlib.closing(conn.cursor()) as cursor:
-                    for prefix in prefixes:
-                        if "%" in prefix:
-                            cursor.execute("DELETE FROM state_variables WHERE key LIKE ?", (prefix,))
-                        else:
-                            cursor.execute("DELETE FROM state_variables WHERE key = ?", (prefix,))
-                        total_deleted += cursor.rowcount
-            return total_deleted
+                return self._state_repo.purge_stale_probe_keys(conn, prefixes)
 
     async def purge_stale_probes(self, prefixes: Optional[List[str]] = None) -> int:
         """Async alias for purge_stale_probe_keys."""
@@ -355,191 +280,27 @@ class VerifiedKVStore:
         async with self._lock:
             conn = self._ensure_conn()
             with conn:
-                conn.execute("""
-                    INSERT INTO transaction_intent_log (tx_id, subject, predicate, object, status, timestamp, error)
-                    VALUES (?, ?, ?, ?, 'PENDING', ?, NULL)
-                """, (tx_id, record.effective_subject, record.predicate, str(record.object), time.time()))
+                self._tx_repo.create_intent(conn, tx_id, record)
 
     async def mark_intent_committed(self, tx_id: str) -> None:
         """Potwierdza pomyślne zakończenie zapisu we wszystkich bazach."""
         async with self._lock:
             conn = self._ensure_conn()
             with conn:
-                conn.execute("UPDATE transaction_intent_log SET status = 'COMMITTED' WHERE tx_id = ?", (tx_id,))
+                self._tx_repo.mark_committed(conn, tx_id)
 
     async def mark_intent_failed(self, tx_id: str, error: str) -> None:
         """Oznacza transakcję jako nieudaną i wymagającą kompensacji."""
         async with self._lock:
             conn = self._ensure_conn()
             with conn:
-                conn.execute("UPDATE transaction_intent_log SET status = 'FAILED', error = ? WHERE tx_id = ?", (error, tx_id))
+                self._tx_repo.mark_failed(conn, tx_id, error)
 
     async def get_dangling_intents(self) -> List[Dict[str, Any]]:
-        """Zwraca listę transakcji, które pozostały w stanie PENDING (np. po nagłym restarcie)."""
+        """Zwraca listę transakcji, które pozostały w stanie PENDING."""
         async with self._lock:
             conn = self._ensure_conn()
-            with contextlib.closing(conn.cursor()) as cursor:
-                cursor.execute("SELECT tx_id, subject, predicate, object, status, timestamp FROM transaction_intent_log WHERE status = 'PENDING'")
-                rows = cursor.fetchall()
-                return [dict(row) for row in rows]
-
-    async def set_state(
-        self,
-        key: str,
-        value: Any,
-        confidence: float = 1.0,
-        metadata: Optional[Dict[str, Any]] = None,
-        reason: str = "update",
-    ) -> None:
-        """Zapisuje stan zmiennej z audytem w bazie danych."""
-        confidence = clamp_conf(confidence)
-        val_json = json.dumps(value, default=str)
-        meta_json = json.dumps(metadata or {}, default=str)
-        now = time.time()
-
-        async with self._lock:
-            with self._sync_lock:
-                conn = self._ensure_conn()
-                with conn:
-                    with contextlib.closing(conn.cursor()) as cursor:
-                        cursor.execute("""
-                            INSERT INTO state_variables (key, value, confidence, timestamp, metadata)
-                            VALUES (?, ?, ?, ?, ?)
-                            ON CONFLICT(key) DO UPDATE SET
-                                value = excluded.value,
-                                confidence = excluded.confidence,
-                                timestamp = excluded.timestamp,
-                                metadata = excluded.metadata
-                        """, (key, val_json, confidence, now, meta_json))
-
-                        val_hash = hashlib.sha256(val_json.encode("utf-8")).hexdigest()
-                        cursor.execute("SELECT seq, entry_hash FROM state_audit_log ORDER BY seq DESC LIMIT 1")
-                        last_row = cursor.fetchone()
-                        if last_row and last_row["entry_hash"]:
-                            next_seq = int(last_row["seq"]) + 1
-                            prev_h = str(last_row["entry_hash"])
-                        else:
-                            next_seq = 1
-                            prev_h = "0" * 64
-                        entry_hash = self._compute_entry_hash(next_seq, now, key, val_hash, prev_h)
-
-                        self._insert_audit_entry_sync(
-                            cursor, next_seq, now, key, val_hash, prev_h, entry_hash, val_json, confidence, reason
-                        )
-                self._prev_hash = entry_hash
-
-    async def get_state(self, key: str) -> Optional[Dict[str, Any]]:
-        async with self._lock:
-            conn = self._ensure_conn()
-            with contextlib.closing(conn.cursor()) as cursor:
-                cursor.execute("SELECT key, value, confidence, timestamp, metadata FROM state_variables WHERE key = ?", (key,))
-                row = cursor.fetchone()
-                if not row:
-                    cursor.execute("SELECT key, value, confidence, timestamp, metadata FROM state_variables WHERE LOWER(key) = LOWER(?) LIMIT 1", (key,))
-                    row = cursor.fetchone()
-                if not row:
-                    return None
-                return self._row_to_state_dict(row)
-
-    async def get_states(self, keys: List[str]) -> Dict[str, Any]:
-        if not keys:
-            return {}
-
-        async with self._lock:
-            conn = self._ensure_conn()
-            placeholders = ",".join("?" for _ in keys)
-            with contextlib.closing(conn.cursor()) as cursor:
-                cursor.execute(f"SELECT key, value, confidence, timestamp, metadata FROM state_variables WHERE key IN ({placeholders})", keys)
-                rows = cursor.fetchall()
-
-                result = {}
-                found_keys = set()
-                for row in rows:
-                    k = row["key"]
-                    found_keys.add(k)
-                    found_keys.add(k.lower())
-                    result[k] = self._row_to_state_dict(row)
-
-                # Case-insensitive fallback for missing keys
-                missing = [k for k in keys if k not in found_keys and k.lower() not in found_keys]
-                if missing:
-                    missing_placeholders = ",".join("?" for _ in missing)
-                    cursor.execute(f"SELECT key, value, confidence, timestamp, metadata FROM state_variables WHERE LOWER(key) IN ({missing_placeholders})", [m.lower() for m in missing])
-                    for row in cursor.fetchall():
-                        result[row["key"]] = self._row_to_state_dict(row)
-
-                return result
-
-    async def get_all_states(self) -> Dict[str, Any]:
-        async with self._lock:
-            conn = self._ensure_conn()
-            with contextlib.closing(conn.cursor()) as cursor:
-                cursor.execute("SELECT key, value, confidence, timestamp, metadata FROM state_variables")
-                rows = cursor.fetchall()
-                result = {}
-                for row in rows:
-                    try:
-                        result[row["key"]] = self._row_to_state_dict(row)
-                    except Exception:
-                        result[row["key"]] = {
-                            "key": row["key"],
-                            "value": str(row["value"]) if row["value"] is not None else "",
-                            "confidence": float(row["confidence"]) if row["confidence"] is not None else 1.0,
-                            "timestamp": float(row["timestamp"]) if row["timestamp"] is not None else 0.0,
-                            "metadata": {},
-                        }
-                return result
-
-    async def delete_state(self, key: str) -> bool:
-        """Asynchroniczne usunięcie zmiennej stanu ze sklepu KV z wpisem do łańcucha audytu SHA-256."""
-        async with self._lock:
-            with self._sync_lock:
-                conn = self._ensure_conn()
-                with conn:
-                    with contextlib.closing(conn.cursor()) as cursor:
-                        cursor.execute("DELETE FROM state_variables WHERE key = ?", (key,))
-                        deleted = cursor.rowcount > 0
-                        if deleted:
-                            # Append delete event to SHA-256 audit hash-chain (ADR-005)
-                            now = time.time()
-                            val_hash = hashlib.sha256(b'"__DELETED__"').hexdigest()
-                            cursor.execute("SELECT seq, entry_hash FROM state_audit_log ORDER BY seq DESC LIMIT 1")
-                            last_row = cursor.fetchone()
-                            if last_row and last_row["entry_hash"]:
-                                next_seq = int(last_row["seq"]) + 1
-                                prev_h = str(last_row["entry_hash"])
-                            else:
-                                next_seq = 1
-                                prev_h = "0" * 64
-                            entry_hash = self._compute_entry_hash(next_seq, now, key, val_hash, prev_h)
-                            self._insert_audit_entry_sync(cursor, next_seq, now, key, val_hash, prev_h, entry_hash, '"__DELETED__"', 0.0, "delete")
-                            self._prev_hash = entry_hash
-                        return deleted
-
-    def delete_sync(self, key: str) -> bool:
-        """Synchroniczne usunięcie zmiennej stanu ze sklepu KV z wpisem do łańcucha audytu SHA-256."""
-        with self._sync_lock:
-            conn = self._ensure_conn()
-            with conn:
-                with contextlib.closing(conn.cursor()) as cursor:
-                    cursor.execute("DELETE FROM state_variables WHERE key = ?", (key,))
-                    deleted = cursor.rowcount > 0
-                    if deleted:
-                        # Append delete event to SHA-256 audit hash-chain (ADR-005)
-                        now = time.time()
-                        val_hash = hashlib.sha256(b'"__DELETED__"').hexdigest()
-                        cursor.execute("SELECT seq, entry_hash FROM state_audit_log ORDER BY seq DESC LIMIT 1")
-                        last_row = cursor.fetchone()
-                        if last_row and last_row["entry_hash"]:
-                            next_seq = int(last_row["seq"]) + 1
-                            prev_h = str(last_row["entry_hash"])
-                        else:
-                            next_seq = 1
-                            prev_h = "0" * 64
-                        entry_hash = self._compute_entry_hash(next_seq, now, key, val_hash, prev_h)
-                        self._insert_audit_entry_sync(cursor, next_seq, now, key, val_hash, prev_h, entry_hash, '"__DELETED__"', 0.0, "delete")
-                        self._prev_hash = entry_hash
-                    return deleted
+            return self._tx_repo.get_dangling_intents(conn)
 
     def set_sync(
         self,
@@ -548,103 +309,265 @@ class VerifiedKVStore:
         confidence: float = 1.0,
         metadata: Optional[Dict[str, Any]] = None,
         reason: str = "update",
+        ttl: Optional[int] = None,
     ) -> None:
         """Synchronous version of set_state for sync ingest & UDS handlers."""
         confidence = clamp_conf(confidence)
-        val_json = json.dumps(value, default=str)
-        meta_json = json.dumps(metadata or {}, default=str)
         now = time.time()
+        meta = dict(metadata or {})
+        if ttl is not None:
+            meta["ttl"] = int(ttl)
+            meta["is_temporary"] = True
+            meta["expires_at"] = now + float(ttl)
+        val_json = json.dumps(value, default=str)
+        meta_json = json.dumps(meta, default=str)
+        val_hash = hashlib.sha256(val_json.encode("utf-8")).hexdigest()
 
         with self._sync_lock:
             conn = self._ensure_conn()
             with conn:
-                with contextlib.closing(conn.cursor()) as cursor:
-                    cursor.execute("""
-                        INSERT INTO state_variables (key, value, confidence, timestamp, metadata)
-                        VALUES (?, ?, ?, ?, ?)
-                        ON CONFLICT(key) DO UPDATE SET
-                            value = excluded.value,
-                            confidence = excluded.confidence,
-                            timestamp = excluded.timestamp,
-                            metadata = excluded.metadata
-                    """, (key, val_json, confidence, now, meta_json))
-
-                    val_hash = hashlib.sha256(val_json.encode("utf-8")).hexdigest()
-                    cursor.execute("SELECT seq, entry_hash FROM state_audit_log ORDER BY seq DESC LIMIT 1")
-                    last_row = cursor.fetchone()
-                    if last_row and last_row["entry_hash"]:
-                        next_seq = int(last_row["seq"]) + 1
-                        prev_h = str(last_row["entry_hash"])
-                    else:
-                        next_seq = 1
-                        prev_h = "0" * 64
-                    entry_hash = self._compute_entry_hash(next_seq, now, key, val_hash, prev_h)
-
-                    self._insert_audit_entry_sync(
-                        cursor, next_seq, now, key, val_hash, prev_h, entry_hash, val_json, confidence, reason
-                    )
+                self._state_repo.set_state(conn, key, val_json, confidence, now, meta_json, val_hash)
+                next_seq, prev_h = self._audit_repo.get_last_entry(conn)
+                entry_hash = self._audit_repo.compute_entry_hash(next_seq, now, key, val_hash, prev_h)
+                self._audit_repo.insert_audit_entry(
+                    conn=conn,
+                    audit_cols=getattr(self, "_audit_cols", set()),
+                    seq=next_seq,
+                    timestamp=now,
+                    key=key,
+                    val_hash=val_hash,
+                    prev_h=prev_h,
+                    entry_hash=entry_hash,
+                    val_json=val_json,
+                    confidence=confidence,
+                    reason=reason,
+                )
             self._prev_hash = entry_hash
+
+    async def set_state(
+        self,
+        key: str,
+        value: Any,
+        confidence: float = 1.0,
+        metadata: Optional[Dict[str, Any]] = None,
+        reason: str = "update",
+        ttl: Optional[int] = None,
+    ) -> None:
+        """Zapisuje stan zmiennej z audytem w bazie danych."""
+        async with self._lock:
+            self.set_sync(
+                key=key,
+                value=value,
+                confidence=confidence,
+                metadata=metadata,
+                reason=reason,
+                ttl=ttl,
+            )
+
+    async def record_sleep_checkpoint(
+        self,
+        checkpoint_id: str,
+        last_processed_step_id: int,
+        sessions_consolidated: int = 0,
+        sops_baked: int = 0,
+        facts_superseded: int = 0,
+        duration_ms: float = 0.0,
+    ) -> bool:
+        """Rejestruje jeden cykl konsolidacji snu w tabeli checkpointów."""
+        if not checkpoint_id:
+            raise ValueError("checkpoint_id is required for sleep checkpoint record")
+        val_json = json.dumps({
+            "last_processed_step_id": int(last_processed_step_id),
+            "sessions_consolidated": int(sessions_consolidated),
+            "sops_baked": int(sops_baked),
+            "facts_superseded": int(facts_superseded),
+            "duration_ms": float(duration_ms),
+        }, default=str)
+        now = time.time()
+
+        async with self._lock:
+            with self._sync_lock:
+                conn = self._ensure_conn()
+                with conn:
+                    created = self._checkpoint_repo.record_checkpoint(
+                        conn=conn,
+                        checkpoint_id=checkpoint_id,
+                        last_processed_step_id=last_processed_step_id,
+                        sessions_consolidated=sessions_consolidated,
+                        sops_baked=sops_baked,
+                        facts_superseded=facts_superseded,
+                        duration_ms=duration_ms,
+                        timestamp=now,
+                    )
+                    if not created:
+                        return False
+                    val_hash = hashlib.sha256(val_json.encode("utf-8")).hexdigest()
+                    next_seq, prev_h = self._audit_repo.get_last_entry(conn)
+                    entry_hash = self._audit_repo.compute_entry_hash(next_seq, now, checkpoint_id, val_hash, prev_h)
+                    self._audit_repo.insert_audit_entry(
+                        conn=conn,
+                        audit_cols=getattr(self, "_audit_cols", set()),
+                        seq=next_seq,
+                        timestamp=now,
+                        key=checkpoint_id,
+                        val_hash=val_hash,
+                        prev_h=prev_h,
+                        entry_hash=entry_hash,
+                        val_json=val_json,
+                        confidence=1.0,
+                        reason="sleep_checkpoint",
+                    )
+                    self._prev_hash = entry_hash
+            return True
+
+    async def get_sleep_checkpoint(self, checkpoint_id: str) -> Optional[Dict[str, Any]]:
+        """Zwraca pojedynczy checkpoint snu lub None."""
+        async with self._lock:
+            conn = self._ensure_conn()
+            return self._checkpoint_repo.get_checkpoint(conn, checkpoint_id)
+
+    async def list_sleep_checkpoints(self, limit: int = 50) -> List[Dict[str, Any]]:
+        """Zwraca ostatnie checkpointy konsolidacji snu (od najnowszego)."""
+        async with self._lock:
+            conn = self._ensure_conn()
+            return self._checkpoint_repo.list_checkpoints(conn, limit)
+
+    async def count_sleep_checkpoints(self) -> int:
+        """Liczba zapisanych cykli konsolidacji snu."""
+        async with self._lock:
+            conn = self._ensure_conn()
+            return self._checkpoint_repo.count_checkpoints(conn)
 
     def get_sync(self, key: str) -> Optional[Dict[str, Any]]:
         """Synchronous version of get_state with case-insensitive fallback."""
         with self._sync_lock:
             conn = self._ensure_conn()
-            with contextlib.closing(conn.cursor()) as cursor:
-                cursor.execute("SELECT key, value, confidence, timestamp, metadata FROM state_variables WHERE key = ?", (key,))
-                row = cursor.fetchone()
-                if not row:
-                    cursor.execute("SELECT key, value, confidence, timestamp, metadata FROM state_variables WHERE LOWER(key) = LOWER(?) LIMIT 1", (key,))
-                    row = cursor.fetchone()
-                if not row:
-                    return None
-                return self._row_to_state_dict(row)
+            return self._state_repo.get_state(conn, key)
 
-    def get_all_sync(self) -> Dict[str, Any]:
-        """Synchronous version of get_all_states."""
+    async def get_state(self, key: str) -> Optional[Dict[str, Any]]:
+        """Asynchroniczne pobranie stanu zmiennej."""
+        async with self._lock:
+            return self.get_sync(key)
+
+    async def get_states(self, keys: List[str]) -> Dict[str, Any]:
+        """Asynchroniczne pobranie wielu stanów zmiennych."""
+        async with self._lock:
+            conn = self._ensure_conn()
+            return self._state_repo.get_states(conn, keys)
+
+    def filter_existing_keys_sync(self, keys: Sequence[str]) -> Set[str]:
+        """Zwraca podzbiór kluczy, które faktycznie istnieją w KV (1 zapytanie SQL)."""
+        conn = self._ensure_conn()
+        return self._state_repo.filter_existing_keys(conn, keys)
+
+    async def filter_existing_keys(self, keys: Sequence[str]) -> Set[str]:
+        """Asynchroniczne wsadowe sprawdzanie istnienia kluczy w KV."""
+        async with self._lock:
+            return self.filter_existing_keys_sync(keys)
+
+    def count_sync(self) -> int:
+        """Zwraca liczbę rekordów w state_variables (O(1) w SQLite)."""
         with self._sync_lock:
             conn = self._ensure_conn()
-            with contextlib.closing(conn.cursor()) as cursor:
-                cursor.execute("SELECT key, value, confidence, timestamp, metadata FROM state_variables")
-                rows = cursor.fetchall()
-                result = {}
-                for row in rows:
-                    try:
-                        result[row["key"]] = self._row_to_state_dict(row)
-                    except Exception:
-                        result[row["key"]] = {
-                            "key": row["key"],
-                            "value": str(row["value"]) if row["value"] is not None else "",
-                            "confidence": float(row["confidence"]) if row["confidence"] is not None else 1.0,
-                            "timestamp": float(row["timestamp"]) if row["timestamp"] is not None else 0.0,
-                            "metadata": {},
-                        }
-                return result
+            return self._state_repo.count(conn)
+
+    async def count(self) -> int:
+        """Asynchroniczne zliczanie rekordów."""
+        async with self._lock:
+            return self.count_sync()
+
+    def delete_sync(self, key: str) -> bool:
+        """Synchroniczne usunięcie zmiennej stanu ze sklepu KV z wpisem do łańcucha audytu SHA-256."""
+        with self._sync_lock:
+            conn = self._ensure_conn()
+            with conn:
+                deleted = self._state_repo.delete_state(conn, key)
+                if deleted:
+                    now = time.time()
+                    val_hash = hashlib.sha256(b'"__DELETED__"').hexdigest()
+                    next_seq, prev_h = self._audit_repo.get_last_entry(conn)
+                    entry_hash = self._audit_repo.compute_entry_hash(next_seq, now, key, val_hash, prev_h)
+                    self._audit_repo.insert_audit_entry(
+                        conn=conn,
+                        audit_cols=getattr(self, "_audit_cols", set()),
+                        seq=next_seq,
+                        timestamp=now,
+                        key=key,
+                        val_hash=val_hash,
+                        prev_h=prev_h,
+                        entry_hash=entry_hash,
+                        val_json='"__DELETED__"',
+                        confidence=0.0,
+                        reason="delete",
+                    )
+                    self._prev_hash = entry_hash
+            return deleted
+
+    async def delete_state(self, key: str) -> bool:
+        """Asynchroniczne usunięcie zmiennej stanu ze sklepu KV z wpisem do łańcucha audytu SHA-256."""
+        async with self._lock:
+            return self.delete_sync(key)
+
+    def search_candidates_sync(
+        self,
+        query: str = "",
+        limit: int = 100,
+        words: Optional[List[str]] = None,
+        stems: Optional[List[str]] = None,
+    ) -> Dict[str, Dict[str, Any]]:
+        """Wyszukiwanie kandydatów w SQL (indeks PK + FTS5) zamiast O(N) skanu tabeli."""
+        with self._sync_lock:
+            conn = self._ensure_conn()
+            return self._state_repo.search_candidates(
+                conn=conn,
+                query=query,
+                limit=limit,
+                words=words,
+                stems=stems,
+            )
+
+    def get_arbitration_candidates_sync(
+        self,
+        key: str,
+        value: Any = None,
+        limit: int = 100,
+    ) -> Dict[str, Dict[str, Any]]:
+        """Zawężanie kandydatów dla ConflictArbiter w SQL zamiast O(N) skanu."""
+        with self._sync_lock:
+            conn = self._ensure_conn()
+            return self._state_repo.get_arbitration_candidates(
+                conn=conn,
+                key=key,
+                value=value,
+                limit=limit,
+            )
+
+    def get_all_sync(self, limit: int = 1000, offset: int = 0, paged: bool = True) -> Dict[str, Any]:
+        """Stronicowane pobieranie rekordów KV."""
+        if paged is False:
+            raise ValueError(
+                "get_all_sync without pagination is prohibited (V80.3 T1). "
+                "Specify paged=True and limit to iterate safely over state_variables."
+            )
+        with self._sync_lock:
+            conn = self._ensure_conn()
+            return self._state_repo.get_all(conn, limit=limit, offset=offset)
+
+    async def get_all_states(self, limit: int = 1000, offset: int = 0, paged: bool = True) -> Dict[str, Any]:
+        """Asynchroniczne stronicowane pobieranie rekordów KV."""
+        if paged is False:
+            raise ValueError(
+                "get_all_states without pagination is prohibited (V80.3 T1). "
+                "Specify paged=True and limit."
+            )
+        async with self._lock:
+            return self.get_all_sync(limit=limit, offset=offset, paged=True)
 
     def get_recent_sync(self, max_age_seconds: float = 900.0, limit: int = 25) -> List[Dict[str, Any]]:
-        """Zwraca najświeższe zapisane stany (np. w oknie 15 minut) posortowane chronologicznie."""
-        cutoff_ts = time.time() - max_age_seconds
+        """Zwraca najświeższe zapisane stany posortowane chronologicznie."""
         with self._sync_lock:
             conn = self._ensure_conn()
-            with contextlib.closing(conn.cursor()) as cursor:
-                cursor.execute(
-                    "SELECT key, value, confidence, timestamp, metadata FROM state_variables WHERE timestamp >= ? ORDER BY timestamp DESC LIMIT ?",
-                    (cutoff_ts, limit),
-                )
-                rows = cursor.fetchall()
-                results = []
-                for row in rows:
-                    try:
-                        results.append(self._row_to_state_dict(row))
-                    except Exception:
-                        results.append({
-                            "key": row["key"],
-                            "value": str(row["value"]) if row["value"] is not None else "",
-                            "confidence": float(row["confidence"]) if row["confidence"] is not None else 1.0,
-                            "timestamp": float(row["timestamp"]) if row["timestamp"] is not None else 0.0,
-                            "metadata": {},
-                        })
-                results.reverse()
-                return results
+            return self._state_repo.get_recent(conn, max_age_seconds=max_age_seconds, limit=limit)
 
     # Aliases
     set = set_sync
@@ -652,8 +575,84 @@ class VerifiedKVStore:
     get_all = get_all_sync
     get_recent = get_recent_sync
 
-    async def close(self) -> None:
+    def checkpoint_wal_sync(self, truncate: bool = True) -> Dict[str, Any]:
+        """Wykonuje kontrolowany WAL checkpoint dla bazy głównej i bazy audytu."""
+        with self._sync_lock:
+            return self._connection_mgr.checkpoint_wal(
+                conn=self._conn,
+                db_path=self.db_path,
+                audit_db_path=self.audit_db_path,
+                truncate=truncate,
+            )
+
+    async def checkpoint_wal(self, truncate: bool = True) -> Dict[str, Any]:
+        """Asynchroniczny wrapper dla checkpoint_wal_sync."""
         async with self._lock:
-            if self._conn:
-                self._conn.close()
-                self._conn = None
+            return self.checkpoint_wal_sync(truncate=truncate)
+
+    def backup_audit_db_sync(self, dest_path: Path | str) -> Path:
+        """Bezpieczna procedura kopii zapasowej bazy audytu (FINDING-072)."""
+        with self._sync_lock:
+            return self._connection_mgr.backup_audit_db(
+                conn=self._conn,
+                audit_db_path=self.audit_db_path,
+                dest_path=dest_path,
+                checkpoint_fn=self.checkpoint_wal_sync,
+            )
+
+    def close_sync(self) -> None:
+        """Zamyka połączenie ze sklepem KV po wykonaniu TRUNCATE checkpoint na WAL."""
+        with self._sync_lock:
+            self._connection_mgr.close(
+                conn=self._conn,
+                db_path=self.db_path,
+                audit_db_path=self.audit_db_path,
+                checkpoint_fn=self.checkpoint_wal_sync,
+            )
+            self._conn = None
+
+    async def close(self) -> None:
+        """Asynchroniczne zamknięcie sklepu KV z checkpointem WAL."""
+        async with self._lock:
+            self.close_sync()
+
+    def count_audit_entries_sync(self) -> int:
+        """Return total number of entries in state_audit_log cleanly without exposing raw SQLite connection."""
+        with self._sync_lock:
+            conn = self._ensure_conn()
+            return self._audit_repo.count_audit_entries(conn)
+
+    def savepoint(self, name: str = "saga_tx") -> None:
+        """Creates a transaction savepoint across KV and attached audit databases."""
+        with self._sync_lock:
+            conn = self._ensure_conn()
+            conn.execute(f"SAVEPOINT {name};")
+            if not hasattr(self, "_savepoint_prev_hashes"):
+                self._savepoint_prev_hashes: Dict[str, str] = {}
+            self._savepoint_prev_hashes[name] = str(self._prev_hash)
+
+    def rollback_savepoint(self, name: str = "saga_tx") -> None:
+        """Rolls back to named savepoint, restoring previous DB state and SHA-256 tip without audit mutation."""
+        with self._sync_lock:
+            conn = self._ensure_conn()
+            conn.execute(f"ROLLBACK TO {name};")
+            conn.execute(f"RELEASE {name};")
+            if hasattr(self, "_savepoint_prev_hashes") and name in self._savepoint_prev_hashes:
+                self._prev_hash = self._savepoint_prev_hashes.pop(name)
+            else:
+                _, self._prev_hash = self._audit_repo.get_last_entry(conn)
+
+    def release_savepoint(self, name: str = "saga_tx") -> None:
+        """Releases named savepoint on successful multi-store commit."""
+        with self._sync_lock:
+            conn = self._ensure_conn()
+            conn.execute(f"RELEASE {name};")
+            if hasattr(self, "_savepoint_prev_hashes"):
+                self._savepoint_prev_hashes.pop(name, None)
+
+    def get_latest_audit_hash(self) -> str:
+        """Returns the current cryptographic tip hash of the SHA-256 audit log."""
+        with self._sync_lock:
+            conn = self._ensure_conn()
+            _, prev_h = self._audit_repo.get_last_entry(conn)
+            return prev_h

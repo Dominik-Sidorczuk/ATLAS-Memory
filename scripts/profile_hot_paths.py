@@ -4,8 +4,7 @@ Hot Path Performance & Memory Profiler (Harness-Foundry V24).
 Measures:
 1. Retrieval Policy Gate Latency (P50/P95/P99).
 2. Epistemic Knapsack Packing Throughput & Information Density.
-3. RaBitQ Fast JIT Asymmetric Scan (100k vectors throughput).
-4. Arrow Trajectory Zero-Copy RAM Tensor allocation.
+3. Arrow Trajectory Zero-Copy RAM Tensor allocation.
 5. RAM Footprint & Tracemalloc delta across all hot paths.
 
 Emits results to docs/baselines/profiling_v24.json.
@@ -26,10 +25,9 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT / "src"))
 
 
-from atlas_memory.arrow_buffer.trajectory_buffer import ArrowTrajectoryBuffer
-from atlas_memory.models import ActionPlan, EpistemicSource, LatentState, MemoryRecord, PredictedTransition
+from atlas_memory.core.models import ActionPlan, EpistemicSource, LatentState, MemoryRecord, PredictedTransition
+from atlas_memory.l1_working.trajectory_buffer import ArrowTrajectoryBuffer
 from atlas_memory.orchestrator import MemoryOrchestrator
-from atlas_memory.quantization.rabitq_engine import RaBitQEngine
 
 
 def profile_hot_paths() -> Dict[str, Any]:
@@ -94,40 +92,7 @@ def profile_hot_paths() -> Dict[str, Any]:
     }
 
     # -------------------------------------------------------------------------
-    # 3. RaBitQ Fast JIT Asymmetric Scan (100k vectors)
-    # -------------------------------------------------------------------------
-    dim = 384
-    n_candidates = 50_000
-    engine = RaBitQEngine(dim=dim, bits=4, seed=42)
-
-    rng = np.random.default_rng(123)
-    dataset = rng.standard_normal((n_candidates, dim)).astype(np.float32)
-    query = rng.standard_normal(dim).astype(np.float32)
-
-    quantized = engine.quantize(dataset)
-
-    # Warm-up JIT
-    _ = engine.fast_asymmetric_scan(query, quantized, top_k=10)
-
-    # Benchmark scan
-    t0 = time.perf_counter()
-    top_indices = engine.fast_asymmetric_scan(query, quantized, top_k=10)
-    t1 = time.perf_counter()
-
-    scan_time_ms = (t1 - t0) * 1000.0
-    throughput_vectors_per_sec = int(n_candidates / max(t1 - t0, 1e-9))
-
-    results["rabitq_fast_scan"] = {
-        "candidates_count": n_candidates,
-        "dimension": dim,
-        "bits_per_dim": 4,
-        "scan_time_ms": round(scan_time_ms, 3),
-        "throughput_vectors_per_sec": throughput_vectors_per_sec,
-        "top_indices_sample": top_indices[:3].tolist(),
-    }
-
-    # -------------------------------------------------------------------------
-    # 4. Arrow Trajectory Zero-Copy RAM Tensor
+    # 3. Arrow Trajectory Zero-Copy RAM Tensor
     # -------------------------------------------------------------------------
     buf = ArrowTrajectoryBuffer(state_dim=32)
     for step in range(500):

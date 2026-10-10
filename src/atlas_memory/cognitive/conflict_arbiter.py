@@ -8,146 +8,190 @@ fatigue gating, and belief revision.
 from __future__ import annotations
 
 import logging
-import re
-from typing import Any, Dict, List, Optional, Set
+from dataclasses import dataclass
+from typing import Any, Dict, List, Optional
 
 from atlas_memory.cognitive.models import ArbitrationCandidate, ArbitrationResult
 
 logger = logging.getLogger(__name__)
 
-STOP_WORDS = {
-    "the", "and", "for", "with", "this", "that", "from", "into", "over",
-    "jest", "oraz", "dla", "przez", "jego", "który", "która", "które",
-    "jako", "jestem", "będzie", "robimy", "w", "na", "z", "do", "o",
-    "po", "od", "za", "ze", "we", "to", "się", "co", "jak", "tak",
-    "ale", "iż", "że", "czy", "nad", "pod", "przed", "przy", "tam", "tu",
-    "ma", "są", "być", "może", "mogą", "należy", "trzeba", "bądź",
-}
-
-EXCLUSIVITY_WORDS = {
-    "wyłącznie", "tylko", "jedynie", "sole", "solely", "exclusively", "only",
-}
-
-PROHIBITION_WORDS = {
-    "nie", "not", "brak", "never", "nigdy", "zabronione", "zabronił", "zabrania",
-    "zakaz", "zakazane", "odrzucona", "bypasses", "usunięty", "forbid",
-    "forbidden", "prohibited", "disallow", "disallowed", "bez", "zabraniać", "zabroniony",
-}
-
-AFFIRMATIVE_WORDS = {
-    "uses", "używa", "używać", "używamy", "is", "jest", "requires", "enabled", "active",
-    "zawsze", "always", "allow", "allowed", "wykonujemy", "zezwala", "pozwala", "zezwól",
-    "stosujemy", "stosuje", "stosować", "dozwolone", "dozwolony", "dozwolona", "wykonaj",
-}
-
-CONTROL_WORDS = EXCLUSIVITY_WORDS | PROHIBITION_WORDS | AFFIRMATIVE_WORDS
-
-GENERIC_WORDS = {
-    "narzędzia", "narzędzie", "narzędzi", "tool", "tools", "funkcja", "funkcji",
-    "metoda", "metody", "sposób", "sposobu", "kod", "kodu", "rzecz", "rzeczy",
-    "rule", "state", "fact", "config", "system", "memory", "atlas", "test",
-    "variable", "item", "default", "wartość", "parametr", "opcja", "użytkownika",
-    "action", "task", "preference", "sensor", "architecture",
-}
-
-DEVELOPER_TOOLS = {
-    "git", "python", "pytest", "bash", "sh", "zsh", "npm", "cargo",
-    "docker", "pip", "pixi", "node", "linux", "sqlite", "redis",
-    "postgres", "postgresql", "mysql", "qdrant", "kuzu", "hermes",
-    "github", "gitlab", "conda", "vscode", "react", "fastapi",
-}
-
-ACTION_PREFIXES = (
-    "wdraż", "deploy", "instal", "urucham", "commit", "push", "merge",
-    "budow", "build", "test", "zapis", "sync", "read", "writ", "zarządz",
-    "edycj", "logow", "pobier", "usuw", "dostęp", "access", "stor",
+from atlas_memory.cognitive.lexicon import (
+    AFFIRMATIVE_WORDS,
+    CONTROL_WORDS,
+    DEVELOPER_TOOLS,
+    ENVIRONMENT_TOKENS,
+    EXCLUSIVITY_WORDS,
+    FUNCTIONAL_SLOTS,
+    GENERIC_WORDS,
+    KNOWN_NAMESPACES,
+    PROHIBITION_WORDS,
+    extract_exclusive_target,
+    extract_governed_action,
+    extract_prohibited_terms,
+    extract_stems,
+    extract_tokens,
+    polish_stem,
 )
 
-ENVIRONMENT_TOKENS = {
-    "staging", "prod", "production", "dev", "development", "test", "testing", "local",
-}
+
+@dataclass(frozen=True)
+class EpistemicCoordinate:
+    """Koordynat tożsamości faktu w modelu Entity-Attribute-Value (EAV).
+
+    Format: <Namespace, EntityID, Slot>
+    """
+
+    namespace: str
+    entity_id: str
+    slot: str
+    is_functional: bool = True
+    raw_key: str = ""
+
+    @property
+    def entity_root(self) -> str:
+        """Kanonik granicy encji (zgodny z ADR-004 i BUG-004)."""
+        if ":" not in self.raw_key:
+            return self.raw_key
+        parts = self.raw_key.split(":")
+        if parts[0] == "hermes" and len(parts) >= 3:
+            return ":".join(parts[:3])
+        if (parts[0] in KNOWN_NAMESPACES or len(parts) >= 3) and len(parts) >= 2:
+            return ":".join(parts[:2])
+        return parts[0]
+
+    @classmethod
+    def from_key(cls, key: str) -> EpistemicCoordinate:
+        clean = key.strip()
+        if ":" not in clean:
+            is_func = clean.lower() in FUNCTIONAL_SLOTS
+            return cls(namespace="fact", entity_id=clean, slot="value", is_functional=is_func, raw_key=clean)
+
+        parts = clean.split(":")
+        ns = parts[0].lower()
+
+        if ns == "hermes" and len(parts) >= 3:
+            return cls(namespace="hermes", entity_id=parts[1], slot=":".join(parts[2:]), is_functional=True, raw_key=clean)
+
+        if len(parts) == 2:
+            slot = parts[1] if parts[1] in FUNCTIONAL_SLOTS else "value"
+            entity_id = parts[1] if slot == "value" else parts[0]
+            is_func = slot in FUNCTIONAL_SLOTS
+            return cls(namespace=ns, entity_id=entity_id, slot=slot, is_functional=is_func, raw_key=clean)
+
+        p1, p2 = parts[1], parts[2]
+        rest = ":".join(parts[3:]) if len(parts) > 3 else ""
+
+        if p1 in FUNCTIONAL_SLOTS and p2 not in FUNCTIONAL_SLOTS:
+            entity_id = f"{p2}:{rest}" if rest else p2
+            slot = p1
+            is_func = True
+        else:
+            entity_id = p1
+            slot = f"{p2}:{rest}" if rest else p2
+            is_func = p2 in FUNCTIONAL_SLOTS or slot in FUNCTIONAL_SLOTS
+
+        return cls(namespace=ns, entity_id=entity_id, slot=slot, is_functional=is_func, raw_key=clean)
 
 
-def polish_stem(word: str) -> str:
-    """Stem Polish words by stripping common grammatical suffixes."""
-    w = word.lower()
-    if w.startswith(("zewnątrz", "zewnętrz")):
-        return "zewnątrz"
-    if len(w) <= 4:
-        return w
-    suffixes = (
-        "owania", "owanie", "owaniu", "owaniach", "owaniami",
-        "alności", "alność", "alnością",
-        "ościach", "ościami", "ościom", "nością", "ności", "ność",
-        "owemu", "owych", "owymi", "owego", "owej", "owym",
-        "iach", "iami", "iom",
-        "ach", "ami", "om",
-        "cja", "cję", "cji", "cją", "cje", "cjo",
-        "ego", "emu", "ych", "ymi", "ym",
-        "em", "am", "om", "ie", "ej", "ze",
-        "a", "e", "y", "i", "o", "u", "ę", "ą",
-    )
-    for suf in suffixes:
-        if w.endswith(suf) and len(w) - len(suf) >= 4:
-            return w[:-len(suf)]
-    return w
+def entity_root(key: str) -> str:
+    """Single source of truth for the entity root of a memory key."""
+    return EpistemicCoordinate.from_key(key).entity_root
 
 
-def extract_tokens(text: str) -> Set[str]:
-    """Extract alphanumeric tokens (length >= 3) excluding stop words."""
-    return {
-        t for t in re.findall(r'[a-zA-Z0-9ąćęłńóśźżĄĆĘŁŃÓŚŹŻ]{3,}', text.lower())
-        if t not in STOP_WORDS
-    }
+MULTI_VALUED_SLOTS: frozenset[str] = frozenset({
+    "tags", "tag", "allowed_users", "users", "members", "roles", "items",
+    "dependencies", "plugins", "features", "scopes", "permissions",
+})
 
 
-def extract_stems(tokens: Set[str]) -> Set[str]:
-    """Extract Polish stems from token set."""
-    return {polish_stem(t) for t in tokens}
+class EpistemicDecisionKernel:
+    """Jedno Jądro Prawdy EAV (F4) wspólne dla ConflictArbitera (online) i DeclarativeConsolidatora (offline).
 
+    Orzeka: 'supersede' | 'accept' | 'warn_conflict'.
+    Gwarantuje nienaruszalność granicy encji (`entity_root`) oraz współistnienie slotów wielowartościowych.
+    """
 
-def extract_prohibited_terms(text: str) -> Set[str]:
-    """Extract target words directly governed by explicit prohibition phrasing."""
-    clauses = re.split(r'[\.\;\,\n\|—–\(\)]', text)
-    prohibited = set()
-    explicit_prohib = {
-        "zakaz", "zakazane", "zabronione", "zabrania", "zabronił", "nigdy", "never",
-        "forbid", "forbidden", "prohibited", "disallow", "disallowed", "zabraniać", "zabroniony",
-    }
-    for clause in clauses:
-        words = re.findall(r'[a-zA-Z0-9ąćęłńóśźżĄĆĘŁŃÓŚŹŻ]{3,}', clause.lower())
-        for idx, w in enumerate(words):
-            is_prohib = (w in explicit_prohib) or (
-                w in ("nie", "not") and idx + 1 < len(words) and words[idx + 1] in (
-                    "wolno", "zezwala", "pozwala", "należy", "używa", "używać", "używaj", "loguj", "uruchamiaj",
+    @staticmethod
+    def is_multi_valued_slot(coord: EpistemicCoordinate) -> bool:
+        slot_tokens = set(coord.slot.lower().replace(":", "_").split("_")) | {
+            coord.slot.lower(),
+            coord.entity_id.lower(),
+        }
+        return bool(slot_tokens & MULTI_VALUED_SLOTS)
+
+    @classmethod
+    def can_supersede(
+        cls,
+        incoming_key: str,
+        existing_key: str,
+        is_explicit_supersede: bool = False,
+    ) -> bool:
+        if is_explicit_supersede or incoming_key == existing_key:
+            return True
+        coord_in = EpistemicCoordinate.from_key(incoming_key)
+        coord_ex = EpistemicCoordinate.from_key(existing_key)
+        if coord_in.entity_root != coord_ex.entity_root:
+            return False
+        if cls.is_multi_valued_slot(coord_in) or cls.is_multi_valued_slot(coord_ex):
+            return False
+        return True
+
+    @classmethod
+    def decide(
+        cls,
+        incoming_key: str,
+        existing_key: str,
+        *,
+        is_user_explicit: bool,
+        incoming_conf: float,
+        existing_conf: float,
+        conf_threshold: float,
+        best_score: float,
+        reason: str,
+        is_explicit_supersede: bool = False,
+        is_rule_melted: bool = False,
+    ) -> str:
+        """Zwraca 'supersede' | 'accept' | 'warn_conflict'."""
+        coord_in = EpistemicCoordinate.from_key(incoming_key)
+        coord_ex = EpistemicCoordinate.from_key(existing_key)
+        if incoming_key != existing_key and (cls.is_multi_valued_slot(coord_in) or cls.is_multi_valued_slot(coord_ex)):
+            return "accept"
+
+        can_auto = cls.can_supersede(incoming_key, existing_key, is_explicit_supersede=is_explicit_supersede)
+        has_topic_match = bool(best_score >= 35.0 or incoming_key == existing_key)
+
+        # Dekrystalizacja i topnienie procedur przy dryfie OOD (v146.0)
+        is_rule_melted_supersede = bool(
+            is_rule_melted
+            and can_auto
+            and incoming_conf >= 0.70
+            and (has_topic_match or incoming_key == existing_key)
+        )
+
+        if is_explicit_supersede or is_rule_melted_supersede or (
+            is_user_explicit
+            and incoming_conf >= conf_threshold
+            and existing_conf <= incoming_conf
+            and can_auto
+            and (
+                incoming_key == existing_key
+                or (
+                    has_topic_match
+                    and reason in (
+                        "exclusivity_collision",
+                        "exclusivity_violation",
+                        "semantic_contradiction",
+                        "prohibition_contradiction",
+                        "functional_slot_revision",
+                    )
                 )
             )
-            if is_prohib:
-                start_offset = 2 if w in ("nie", "not") else 1
-                for next_w in words[idx + start_offset: idx + start_offset + 5]:
-                    if (
-                        next_w not in STOP_WORDS
-                        and next_w not in PROHIBITION_WORDS
-                        and next_w not in GENERIC_WORDS
-                    ):
-                        prohibited.add(next_w)
-    return prohibited
+        ):
+            return "supersede"
 
-
-def extract_exclusive_target(text: str) -> Set[str]:
-    """Extract target entities or tools bound to exclusivity modifiers."""
-    targets = set()
-    pattern = r'(?:wyłącznie|tylko|jedynie|solely|exclusively|only)\s+(?:przez|za\s+pomocą|via|through|in|w\s+języku|w|jako|dla)?\s*([a-zA-Z0-9ąćęłńóśźżĄĆĘŁŃÓŚŹŻ\s]{3,35})'
-    for m in re.finditer(pattern, text.lower()):
-        matched_phrase = m.group(1)
-        sub_tokens = extract_tokens(matched_phrase) - CONTROL_WORDS - GENERIC_WORDS
-        targets |= sub_tokens
-    return targets
-
-
-def extract_governed_action(tokens: Set[str]) -> Set[str]:
-    """Identify action verbs from known stem prefixes."""
-    return {t for t in tokens if any(polish_stem(t).startswith(p) for p in ACTION_PREFIXES)}
+        if reason == "confidence_inversion" or best_score >= 35.0:
+            return "warn_conflict"
+        return "accept"
 
 
 class ConflictArbiter:
@@ -167,10 +211,33 @@ class ConflictArbiter:
       - Ignores records already tagged with is_superseded = True
     """
 
-    def __init__(self, config: Optional[Dict[str, Any]] = None) -> None:
+    def __init__(
+        self,
+        config: Optional[Dict[str, Any]] = None,
+        active_sensing_engine: Optional[Any] = None,
+    ) -> None:
         self.config = config or {}
         self.confidence_threshold = float(self.config.get("confidence_threshold", 0.95))
         self.high_score_threshold = float(self.config.get("high_score_threshold", 35.0))
+        if active_sensing_engine is not None:
+            self.active_sensing_engine = active_sensing_engine
+
+    @property
+    def active_sensing(self) -> Optional[Any]:
+        return getattr(self, "active_sensing_engine", None)
+
+    @active_sensing.setter
+    def active_sensing(self, val: Any) -> None:
+        self.active_sensing_engine = val
+
+    def _get_active_sensing_engine(self) -> Optional[Any]:
+        if getattr(self, "active_sensing_engine", None) is not None:
+            return self.active_sensing_engine
+        try:
+            from atlas_memory.active.prediction_error import get_active_sensing_engine
+            return get_active_sensing_engine()
+        except Exception:
+            return None
 
     def generate_candidates(
         self,
@@ -183,297 +250,544 @@ class ConflictArbiter:
         """
         Stage 1: Scan existing items and compute candidate conflict scores.
         Returns all candidates sorted in descending order of candidate_score.
+
+        V117: rozbito monolit CC=156 na ortogonalne, testowalne komponenty
+        (pancerz rownowaznosci: tests/test_v117_golden_master.py).
         """
         candidates: List[ArbitrationCandidate] = []
         val_str = str(val).lower() if val is not None else ""
-        k_lower = key.lower()
+        incoming = self._incoming_profile(key, val_str, confidence, metadata)
 
         # Explicit conflict marker in incoming key/metadata
-        if "conflict" in k_lower or metadata.get("is_conflict_test") or metadata.get("test_type") == "conflict":
+        if (
+            "conflict" in key.lower()
+            or metadata.get("is_conflict_test")
+            or metadata.get("test_type") == "conflict"
+        ):
             candidates.append(
-                ArbitrationCandidate(
-                    key=key,
-                    score=100.0,
-                    reason="explicit_conflict_marker",
-                    conflict_type="explicit_conflict_marker",
-                    conflicting_fact=val_str,
-                    incoming_claim=str(val),
-                    overlapping_terms=[key],
-                    message=f"Epistemic conflict detected for marked key '{key}'.",
-                    confidence=confidence,
-                    metadata={"is_explicit": True},
-                )
+                self._explicit_marker_candidate(key, val, val_str, confidence)
             )
 
+        for ex_k, item in existing_items.items():
+            cand = self._scan_existing_item(
+                ex_k, item, key, val, val_str, confidence, metadata, incoming
+            )
+            if cand is not None:
+                candidates.append(cand)
+
+        # Sort all candidates descending by score (never take first dictionary match)
+        candidates.sort(key=lambda c: c.score, reverse=True)
+        return candidates
+
+    # ── V117 helpers: profil wejscia / parsingu istniejacego rekordu ──────────────
+
+    def _incoming_profile(
+        self, key: str, val_str: str, confidence: float, metadata: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """Ekstraktuje profil leksykalny zapisu przychodzacego (czysta funkcja)."""
         tokens = extract_tokens(f"{key} {val_str}")
         topic_tokens = tokens - CONTROL_WORDS
         topic_stems = extract_stems(topic_tokens)
         specific_tokens = topic_tokens - GENERIC_WORDS - DEVELOPER_TOOLS
         specific_stems = topic_stems - {polish_stem(g) for g in (GENERIC_WORDS | DEVELOPER_TOOLS)}
 
-        has_excl = bool(tokens & EXCLUSIVITY_WORDS)
-        has_prohib = bool(tokens & PROHIBITION_WORDS)
-        has_aff = bool(tokens & AFFIRMATIVE_WORDS)
-        in_prohibited = extract_prohibited_terms(f"{key} {val_str}")
-        in_prohib_stems = extract_stems(in_prohibited)
-        in_excl_targets = extract_exclusive_target(f"{key} {val_str}")
-        in_gov_actions = extract_governed_action(topic_tokens)
-
-        tools_in = {t for t in tokens if t in DEVELOPER_TOOLS}
-        env_in = {p for p in key.split(":") if p in ENVIRONMENT_TOKENS} | {t for t in tokens if t in ENVIRONMENT_TOKENS}
-
         source_type = str(metadata.get("source_type") or metadata.get("source") or "user_explicit")
         is_user_explicit = (source_type == "user_explicit" or (confidence >= self.confidence_threshold and source_type != "agent_inference"))
 
-        for ex_k, item in existing_items.items():
-            # Check if existing item is marked as superseded
-            if getattr(item, "is_superseded", False):
-                continue
-            if isinstance(item, dict):
-                ex_meta = dict(item.get("metadata") or {})
-                if item.get("is_superseded") is True or ex_meta.get("is_superseded") is True or ex_meta.get("superseded") is True:
-                    continue
-                ex_val = str(item.get("value") or item.get("val") or item.get("object") or "")
-                ex_conf = float(item.get("confidence", 1.0))
-            else:
-                ex_val = str(getattr(item, "value", getattr(item, "object", "")))
-                ex_conf = float(getattr(item, "confidence", 1.0))
-                ex_meta = dict(getattr(item, "metadata", {}) or {})
-                if ex_meta.get("is_superseded") is True or ex_meta.get("superseded") is True:
-                    continue
+        return {
+            "tokens": tokens,
+            "topic_tokens": topic_tokens,
+            "topic_stems": topic_stems,
+            "specific_tokens": specific_tokens,
+            "specific_stems": specific_stems,
+            "has_excl": bool(tokens & EXCLUSIVITY_WORDS),
+            "has_prohib": bool(tokens & PROHIBITION_WORDS),
+            "has_aff": bool(tokens & AFFIRMATIVE_WORDS),
+            "prohibited": extract_prohibited_terms(f"{key} {val_str}"),
+            "prohib_stems": extract_stems(extract_prohibited_terms(f"{key} {val_str}")),
+            "excl_targets": extract_exclusive_target(f"{key} {val_str}"),
+            "gov_actions": extract_governed_action(topic_tokens),
+            "tools": {t for t in tokens if t in DEVELOPER_TOOLS},
+            "env": {p for p in key.split(":") if p in ENVIRONMENT_TOKENS} | {t for t in tokens if t in ENVIRONMENT_TOKENS},
+            "is_user_explicit": is_user_explicit,
+        }
 
-            ex_val_lower = ex_val.lower()
+    @staticmethod
+    def _explicit_marker_candidate(key, val, val_str, confidence):
+        """Jawny marker konfliktu w kluczu/metadata → kandydat score=100."""
+        return ArbitrationCandidate(
+            key=key,
+            score=100.0,
+            reason="explicit_conflict_marker",
+            conflict_type="explicit_conflict_marker",
+            conflicting_fact=val_str,
+            incoming_claim=str(val),
+            overlapping_terms=[key],
+            message=f"Epistemic conflict detected for marked key '{key}'.",
+            confidence=confidence,
+            metadata={"is_explicit": True},
+        )
 
-            # Case A: Same key collision
-            if ex_k == key:
-                # Same value — still check confidence inversion before skipping (T05 fix)
-                if ex_val_lower == val_str:
-                    ex_source = str(ex_meta.get("source_type") or ex_meta.get("source") or "")
-                    if (ex_conf >= 0.90 or ex_source == "user_explicit") and confidence < ex_conf:
-                        candidates.append(
-                            ArbitrationCandidate(
-                                key=ex_k,
-                                score=90.0,
-                                reason="confidence_inversion",
-                                conflict_type="confidence_inversion",
-                                conflicting_fact=ex_val,
-                                incoming_claim=str(val),
-                                overlapping_terms=[key],
-                                message=f"Incoming write has lower confidence ({confidence}) than established fact ({ex_conf}).",
-                                confidence=ex_conf,
-                                metadata=ex_meta,
-                            )
-                        )
-                    continue  # Identical value write (with or without inversion candidate)
-                
-                # Check belief revision condition: user_explicit write with confidence >= threshold and conf >= existing
-                if is_user_explicit and confidence >= self.confidence_threshold and ex_conf <= confidence:
-                    candidates.append(
-                        ArbitrationCandidate(
-                            key=ex_k,
-                            score=95.0,
-                            reason="belief_revision",
-                            conflict_type="belief_revision",
-                            conflicting_fact=ex_val,
-                            incoming_claim=str(val),
-                            overlapping_terms=[key],
-                            message=f"Belief revision: user updated value for key '{key}'.",
-                            confidence=ex_conf,
-                            metadata=ex_meta,
-                        )
-                    )
-                    continue
+    @staticmethod
+    def _parse_existing_item(item: Any):
+        """Zwraca (ex_val, ex_conf, ex_meta) albo None gdy rekord superseded (guard clause)."""
+        if getattr(item, "is_superseded", False):
+            return None
+        if isinstance(item, dict):
+            ex_meta = dict(item.get("metadata") or {})
+            if item.get("is_superseded") is True or ex_meta.get("is_superseded") is True or ex_meta.get("superseded") is True:
+                return None
+            ex_val = str(item.get("value") or item.get("val") or item.get("object") or "")
+            ex_conf = float(item.get("confidence", 1.0))
+        else:
+            ex_val = str(getattr(item, "value", getattr(item, "object", "")))
+            ex_conf = float(getattr(item, "confidence", 1.0))
+            ex_meta = dict(getattr(item, "metadata", {}) or {})
+            if ex_meta.get("is_superseded") is True or ex_meta.get("superseded") is True:
+                return None
+        return ex_val, ex_conf, ex_meta
 
-                # Check confidence inversion: lower confidence write attempting to override established fact
-                ex_source = str(ex_meta.get("source_type") or ex_meta.get("source") or "")
-                if (ex_conf >= 0.90 or ex_source == "user_explicit") and confidence < ex_conf:
-                    candidates.append(
-                        ArbitrationCandidate(
-                            key=ex_k,
-                            score=90.0,
-                            reason="confidence_inversion",
-                            conflict_type="confidence_inversion",
-                            conflicting_fact=ex_val,
-                            incoming_claim=str(val),
-                            overlapping_terms=[key],
-                            message=f"Incoming write has lower confidence ({confidence}) than established fact ({ex_conf}).",
-                            confidence=ex_conf,
-                            metadata=ex_meta,
-                        )
-                    )
-                    continue
+    def _scan_existing_item(
+        self, ex_k, item, key, val, val_str, confidence, metadata, incoming
+    ) -> Optional[ArbitrationCandidate]:
+        """Jedna iteracja petli po existing_items: max 1 kandydat na rekord."""
+        parsed = self._parse_existing_item(item)
+        if parsed is None:
+            return None
+        ex_val, ex_conf, ex_meta = parsed
+        ex_val_lower = ex_val.lower()
 
-            # Case B: Cross-key relationship
-            # Ignore conversational churn or episodic working memory
-            if ex_k.startswith(("mnemosyne:mnemosyne_working_memory:", "mnemosyne:mnemosyne_episodic_memory:", "conversation", "fact:conversation")) or ex_k.endswith(":episodic_event"):
-                continue
-
-            ex_tokens = extract_tokens(f"{ex_k} {ex_val_lower}")
-            ex_topic_tokens = ex_tokens - CONTROL_WORDS
-            ex_topic_stems = extract_stems(ex_topic_tokens)
-            ex_specific_tokens = ex_topic_tokens - GENERIC_WORDS - DEVELOPER_TOOLS
-            ex_specific_stems = ex_topic_stems - {polish_stem(g) for g in (GENERIC_WORDS | DEVELOPER_TOOLS)}
-
-            tools_ex = {t for t in ex_tokens if t in DEVELOPER_TOOLS}
-            env_ex = {p for p in ex_k.split(":") if p in ENVIRONMENT_TOKENS} | {t for t in ex_tokens if t in ENVIRONMENT_TOKENS}
-
-            # Orthogonal environments guard (e.g. staging vs production)
-            if env_in and env_ex and not (env_in & env_ex):
-                continue
-
-            # Orthogonal developer tools guard (e.g. git vs pytest, docker vs pixi)
-            ns_in = [p for p in key.split(":")[:-1] if p not in GENERIC_WORDS]
-            ns_ex = [p for p in ex_k.split(":")[:-1] if p not in GENERIC_WORDS]
-            same_ns = (len(ns_in) >= 1 and ns_in == ns_ex)
-
-            if tools_in and tools_ex and not (tools_in & tools_ex) and not same_ns:
-                continue
-
-            token_overlap = (topic_tokens & ex_topic_tokens) - GENERIC_WORDS
-            stem_overlap = (topic_stems & ex_topic_stems) - {polish_stem(g) for g in GENERIC_WORDS}
-            specific_overlap = specific_tokens & ex_specific_tokens
-            specific_stem_overlap = specific_stems & ex_specific_stems
-
-            has_topic_overlap = (same_ns and (len(token_overlap) >= 1 or len(stem_overlap) >= 1)) or (
-                len(specific_overlap) >= 2 or len(specific_stem_overlap) >= 2 or (len(token_overlap) >= 2 and len(specific_overlap) >= 1)
+        # Case 0: Explicit belief revision targeting this key
+        if metadata.get("supersedes") == ex_k:
+            return ArbitrationCandidate(
+                key=ex_k,
+                score=100.0,
+                reason="belief_revision",
+                conflict_type="belief_revision",
+                conflicting_fact=ex_val,
+                incoming_claim=str(val),
+                overlapping_terms=[ex_k],
+                message=f"Explicit belief revision: write supersedes '{ex_k}'.",
+                confidence=ex_conf,
+                metadata=ex_meta,
             )
 
-            ex_has_excl = bool(ex_tokens & EXCLUSIVITY_WORDS)
-            ex_has_prohib = bool(ex_tokens & PROHIBITION_WORDS)
-            ex_has_aff = bool(ex_tokens & AFFIRMATIVE_WORDS)
-            ex_prohibited = extract_prohibited_terms(f"{ex_k} {ex_val_lower}")
-            ex_prohib_stems = extract_stems(ex_prohibited)
-            ex_excl_targets = extract_exclusive_target(f"{ex_k} {ex_val_lower}")
-            ex_gov_actions = extract_governed_action(ex_topic_tokens)
+        if ex_k == key:
+            skip, cand = self._evaluate_same_key(
+                ex_k, ex_val, ex_val_lower, ex_conf, ex_meta,
+                key, val, val_str, confidence, incoming,
+            )
+            if skip:
+                return cand
 
-            # Consensus Protection: Shared prohibitions are agreement, not contradiction
-            shared_prohib = (in_prohibited & ex_prohibited) | {t for t in in_prohibited if polish_stem(t) in ex_prohib_stems}
-            if has_prohib and ex_has_prohib and shared_prohib:
-                # Both agree on prohibition
-                continue
+        return self._scan_cross_key(ex_k, ex_val, ex_val_lower, ex_conf, ex_meta, key, val, incoming)
 
-            if not has_topic_overlap:
-                # Check for direct action overlap with conflicting polarity
-                actions_match = bool(in_gov_actions & ex_gov_actions)
-                if not (actions_match and (has_excl or ex_has_excl or has_prohib or ex_has_prohib)):
-                    continue
+    def _evaluate_same_key(
+        self, ex_k, ex_val, ex_val_lower, ex_conf, ex_meta, key, val, val_str, confidence, incoming
+    ):
+        """Case A: kolizja tego samego klucza. Zwraca (handled|_FALLTHROUGH, candidate|None)."""
+        if ex_val_lower == val_str:
+            # Same value — check for significant confidence degradation (> 0.20 drop) before skipping
+            return True, self._confidence_inversion_candidate(
+                ex_k, ex_val, ex_conf, ex_meta, val, confidence, same_value=True
+            )
+        is_user_explicit = incoming["is_user_explicit"]
+        rule_prefixes = ("rule:", "user_rule:", "preference:", "constraint:")
+        is_ex_rule = ex_k.startswith(rule_prefixes)
+        is_rule_melted = False
+        ase = self._get_active_sensing_engine()
+        if is_ex_rule and ase is not None:
+            coord_ex = EpistemicCoordinate.from_key(ex_k)
+            if hasattr(ase, "is_entity_critical"):
+                if ase.is_entity_critical(coord_ex.entity_id) or ase.is_entity_critical(ex_k):
+                    is_rule_melted = True
 
-            candidate_score = 0.0
-            if same_ns:
-                candidate_score += 50.0
+        # Belief revision: user_explicit write, conf >= threshold, conf >= existing OR melted rule superseded under OOD
+        if (is_user_explicit and confidence >= self.confidence_threshold and ex_conf <= confidence) or (is_rule_melted and confidence >= 0.70):
+            cand_meta = dict(ex_meta or {}) if is_rule_melted else ex_meta
+            if is_rule_melted:
+                cand_meta["is_rule_melted"] = True
+            return True, ArbitrationCandidate(
+                key=ex_k,
+                score=95.0,
+                reason="belief_revision",
+                conflict_type="belief_revision",
+                conflicting_fact=ex_val,
+                incoming_claim=str(val),
+                overlapping_terms=[key],
+                message=(
+                    f"Belief revision: melted rule '{key}' superseded under OOD drift."
+                    if is_rule_melted
+                    else f"Belief revision: user updated value for key '{key}'."
+                ),
+                confidence=ex_conf,
+                metadata=cand_meta,
+            )
+        inversion = self._confidence_inversion_candidate(ex_k, ex_val, ex_conf, ex_meta, val, confidence)
+        if inversion is not None:
+            return True, inversion
+        return False, None
 
-            is_in_rule = key.startswith(("rule:", "user_rule:", "preference:", "constraint:"))
-            is_ex_rule = ex_k.startswith(("rule:", "user_rule:", "preference:", "constraint:"))
-            if is_in_rule and is_ex_rule:
-                candidate_score += 35.0
-            elif is_ex_rule:
-                candidate_score += 15.0
+    @staticmethod
+    def _confidence_inversion_candidate(ex_k, ex_val, ex_conf, ex_meta, val, confidence, same_value=False):
+        """Nizsza pewnosc przy nadpisaniu ustalonego faktu → kandydat score=90 albo None."""
+        ex_source = str(ex_meta.get("source_type") or ex_meta.get("source") or "")
+        min_drop = 0.20 if same_value else 0.0
+        if (ex_conf >= 0.90 or ex_source == "user_explicit") and (ex_conf - confidence > min_drop):
+            return ArbitrationCandidate(
+                key=ex_k,
+                score=90.0,
+                reason="confidence_inversion",
+                conflict_type="confidence_inversion",
+                conflicting_fact=ex_val,
+                incoming_claim=str(val),
+                overlapping_terms=[ex_k],
+                message=f"Incoming write has lower confidence ({confidence}) than established fact ({ex_conf}).",
+                confidence=ex_conf,
+                metadata=ex_meta,
+            )
+        return None
+    def _existing_profile(self, ex_k: str, ex_val_lower: str) -> Dict[str, Any]:
+        """Profil leksykalny istniejacego rekordu (lustrzany do _incoming_profile)."""
+        ex_tokens = extract_tokens(f"{ex_k} {ex_val_lower}")
+        ex_topic_tokens = ex_tokens - CONTROL_WORDS
+        ex_topic_stems = extract_stems(ex_topic_tokens)
+        ex_specific_tokens = ex_topic_tokens - GENERIC_WORDS - DEVELOPER_TOOLS
+        ex_specific_stems = ex_topic_stems - {polish_stem(g) for g in (GENERIC_WORDS | DEVELOPER_TOOLS)}
+        ex_prohibited = extract_prohibited_terms(f"{ex_k} {ex_val_lower}")
+        return {
+            "tokens": ex_tokens,
+            "topic_tokens": ex_topic_tokens,
+            "topic_stems": ex_topic_stems,
+            "specific_tokens": ex_specific_tokens,
+            "specific_stems": ex_specific_stems,
+            "has_excl": bool(ex_tokens & EXCLUSIVITY_WORDS),
+            "has_prohib": bool(ex_tokens & PROHIBITION_WORDS),
+            "has_aff": bool(ex_tokens & AFFIRMATIVE_WORDS),
+            "prohibited": ex_prohibited,
+            "prohib_stems": extract_stems(ex_prohibited),
+            "excl_targets": extract_exclusive_target(f"{ex_k} {ex_val_lower}"),
+            "gov_actions": extract_governed_action(ex_topic_tokens),
+            "tools": {t for t in ex_tokens if t in DEVELOPER_TOOLS},
+            "env": {p for p in ex_k.split(":") if p in ENVIRONMENT_TOKENS} | {t for t in ex_tokens if t in ENVIRONMENT_TOKENS},
+        }
 
-            if ex_k.startswith("mnemosyne:"):
-                candidate_score -= 40.0
+    @staticmethod
+    def _skip_episodic(ex_k: str) -> bool:
+        """Ignore conversational churn or episodic working memory."""
+        prefixes = (
+            "mnemosyne:mnemosyne_working_memory:",
+            "mnemosyne:mnemosyne_episodic_memory:",
+            "conversation",
+            "fact:conversation",
+        )
+        return ex_k.startswith(prefixes) or ex_k.endswith(":episodic_event")
 
-            candidate_score += 15.0 * len(specific_overlap)
-            candidate_score += 10.0 * len(specific_stem_overlap)
-            candidate_score += 5.0 * len(token_overlap)
-            candidate_score += ex_conf * 5.0
+    @staticmethod
+    def _orthogonal_envs(env_in, env_ex) -> bool:
+        """Orthogonal environments guard (e.g. staging vs production)."""
+        return bool(env_in and env_ex and not (env_in & env_ex))
 
-            found_conflict = None
+    @staticmethod
+    def _orthogonal_tools(tools_in, tools_ex, same_ns: bool) -> bool:
+        """Orthogonal developer tools guard (e.g. git vs pytest, docker vs pixi)."""
+        return bool(tools_in and tools_ex and not (tools_in & tools_ex) and not same_ns)
 
-            # 1. Exclusivity collision: competing exclusive assertions on shared domain
-            if has_excl and ex_has_excl:
-                actions_match = bool(in_gov_actions & ex_gov_actions)
-                targets_differ = bool(in_excl_targets and ex_excl_targets and not (in_excl_targets & ex_excl_targets))
-                differing = (specific_tokens - ex_specific_tokens) | (ex_specific_tokens - specific_tokens)
-                if (actions_match and targets_differ) or (differing and (same_ns or len(specific_overlap) >= 1 or len(stem_overlap) >= 1)):
-                    found_conflict = {
-                        "reason": "exclusivity_collision",
-                        "conflict_type": "exclusivity_collision",
-                        "conflicting_fact": ex_val,
-                        "incoming_claim": str(val),
-                        "overlapping_terms": list(token_overlap or stem_overlap or in_excl_targets),
-                        "message": f"Incoming exclusivity assertion contradicts established exclusivity rule '{ex_k}'.",
-                    }
-                    candidate_score += 40.0
+    @staticmethod
+    def _same_namespace(key: str, ex_k: str, coord_in, coord_ex) -> bool:
+        ns_in = [p for p in key.split(":")[:-1] if p not in GENERIC_WORDS]
+        ns_ex = [p for p in ex_k.split(":")[:-1] if p not in GENERIC_WORDS]
+        coord_match = coord_in.namespace == coord_ex.namespace and coord_in.entity_id == coord_ex.entity_id
+        return bool(coord_match or (len(ns_in) >= 1 and ns_in == ns_ex))
 
-            # 2. Prohibition contradiction: incoming asserts what memory prohibits
-            if found_conflict is None and ex_has_prohib and not has_prohib:
-                prohibited_overlap = (((specific_tokens & ex_prohibited) | {t for t in specific_tokens if polish_stem(t) in ex_prohib_stems}) - shared_prohib)
-                has_action_in_prohib = any(t in prohibited_overlap for t in ("push", "commit", "zapis", "edit", "edycja", "bezpośrednio", "bezpośredni", "delete", "remove", "drop", "root", "hasło", "hasła", "secret", "secrets"))
-                if prohibited_overlap and (len(prohibited_overlap) >= 2 or has_action_in_prohib or same_ns):
-                    found_conflict = {
-                        "reason": "semantic_contradiction",
-                        "conflict_type": "prohibition_contradiction",
-                        "conflicting_fact": ex_val,
-                        "incoming_claim": str(val),
-                        "overlapping_terms": list(prohibited_overlap),
-                        "message": f"Incoming write asserts action prohibited by established memory '{ex_k}'.",
-                    }
-                    candidate_score += 35.0
+    @staticmethod
+    def _overlap_measures(incoming, exp) -> Dict[str, Any]:
+        token_overlap = (incoming["topic_tokens"] & exp["topic_tokens"]) - GENERIC_WORDS
+        stem_overlap = (incoming["topic_stems"] & exp["topic_stems"]) - {polish_stem(g) for g in GENERIC_WORDS}
+        specific_overlap = incoming["specific_tokens"] & exp["specific_tokens"]
+        specific_stem_overlap = incoming["specific_stems"] & exp["specific_stems"]
+        in_meaningful = incoming["specific_tokens"] | incoming["specific_stems"]
+        ex_meaningful = exp["specific_tokens"] | exp["specific_stems"]
+        shorter_len = max(1, min(len(in_meaningful), len(ex_meaningful)))
+        overlap_count = len(specific_overlap | specific_stem_overlap)
+        return {
+            "token_overlap": token_overlap,
+            "stem_overlap": stem_overlap,
+            "specific_overlap": specific_overlap,
+            "specific_stem_overlap": specific_stem_overlap,
+            "overlap_count": overlap_count,
+            "overlap_density": overlap_count / shorter_len,
+        }
 
-            # 3. Capability conflict: incoming prohibits capability established in memory
-            if found_conflict is None and has_prohib and not ex_has_prohib and ex_has_aff:
-                prohibited_overlap = (((ex_specific_tokens & in_prohibited) | {t for t in ex_specific_tokens if polish_stem(t) in in_prohib_stems}) - shared_prohib)
-                if prohibited_overlap and (is_ex_rule or len(specific_overlap) >= 1 or same_ns):
-                    found_conflict = {
-                        "reason": "semantic_contradiction",
-                        "conflict_type": "prohibition_contradiction",
-                        "conflicting_fact": ex_val,
-                        "incoming_claim": str(val),
-                        "overlapping_terms": list(prohibited_overlap),
-                        "message": f"Incoming write prohibits capability established in memory '{ex_k}'.",
-                    }
-                    candidate_score += 30.0
+    @staticmethod
+    def _has_topic_overlap(ov, same_ns: bool) -> bool:
+        left = same_ns and (len(ov["token_overlap"]) >= 1 or len(ov["stem_overlap"]) >= 1)
+        mid = (
+            len(ov["specific_overlap"]) >= 2
+            or len(ov["specific_stem_overlap"]) >= 2
+            or (len(ov["token_overlap"]) >= 2 and len(ov["specific_overlap"]) >= 1)
+        )
+        right = same_ns or ov["overlap_density"] >= 0.25 or ov["overlap_count"] >= 4
+        return bool(left or (mid and right))
 
-            # 4. Exclusivity violation: existing has exclusivity, incoming asserts alternative target
-            if found_conflict is None and ex_has_excl and not has_excl:
-                shared_actions = (in_gov_actions & ex_gov_actions)
-                if shared_actions or (same_ns and len(specific_overlap) >= 1):
-                    overlap_stems = stem_overlap
-                    authorized_targets = (ex_topic_tokens - {t for t in ex_topic_tokens if polish_stem(t) in overlap_stems}) - ex_prohibited
-                    incoming_targets = topic_tokens - {t for t in topic_tokens if polish_stem(t) in overlap_stems}
-                    if (incoming_targets and not (incoming_targets & authorized_targets)) or (topic_tokens & ex_prohibited):
-                        found_conflict = {
-                            "reason": "exclusivity_violation",
-                            "conflict_type": "exclusivity_violation",
-                            "conflicting_fact": ex_val,
-                            "incoming_claim": str(val),
-                            "overlapping_terms": list(token_overlap or stem_overlap),
-                            "message": f"Incoming assertion violates established exclusive rule '{ex_k}'.",
-                        }
-                        candidate_score += 35.0
+    @staticmethod
+    def _action_polarity_fallback(incoming, exp) -> bool:
+        """Bez topic overlap: konflikt tylko gdy akcje sie pokrywaja z przeciwna polaryzacja."""
+        actions_match = bool(incoming["gov_actions"] & exp["gov_actions"])
+        return bool(actions_match and (incoming["has_excl"] or exp["has_excl"] or incoming["has_prohib"] or exp["has_prohib"]))
 
-            # 5. Direct polarity / semantic contradiction
-            if found_conflict is None and ((has_prohib and ex_has_aff and not ex_has_prohib) or (has_aff and ex_has_prohib and not has_prohib)):
-                if len(specific_overlap) >= 2 or (same_ns and len(token_overlap) >= 2):
-                    found_conflict = {
-                        "reason": "semantic_contradiction",
-                        "conflict_type": "semantic_contradiction",
-                        "conflicting_fact": ex_val,
-                        "incoming_claim": str(val),
-                        "overlapping_terms": list(token_overlap or stem_overlap),
-                        "message": f"Incoming write contradicts established memory '{ex_k}'.",
-                    }
-                    candidate_score += 25.0
+    @staticmethod
+    def _consensus_agreement(incoming, exp, shared_prohib) -> bool:
+        """Consensus Protection: Shared prohibitions are agreement, not contradiction."""
+        return bool(incoming["has_prohib"] and exp["has_prohib"] and shared_prohib)
 
-            if found_conflict is not None:
-                candidates.append(
-                    ArbitrationCandidate(
-                        key=ex_k,
-                        score=candidate_score,
-                        reason=found_conflict["reason"],
-                        conflict_type=found_conflict.get("conflict_type"),
-                        conflicting_fact=found_conflict.get("conflicting_fact"),
-                        incoming_claim=found_conflict.get("incoming_claim"),
-                        overlapping_terms=list(found_conflict.get("overlapping_terms") or []),
-                        message=found_conflict.get("message"),
-                        confidence=ex_conf,
-                        metadata=ex_meta,
-                    )
-                )
+    @staticmethod
+    def _base_cross_score(ctx) -> float:
+        score = 0.0
+        key, ex_k = ctx["key"], ctx["ex_k"]
+        if ctx["same_ns"]:
+            score += 50.0
+        rule_prefixes = ("rule:", "user_rule:", "preference:", "constraint:")
+        is_in_rule = key.startswith(rule_prefixes)
+        is_ex_rule = ex_k.startswith(rule_prefixes)
+        
+        # Termodynamiczna Dekrystalizacja Procedur (Topnienie SOP przy dryfie OOD, v146.0)
+        is_rule_melted = False
+        ase = ctx.get("active_sensing_engine")
+        if is_ex_rule and ase is not None:
+            coord_ex = EpistemicCoordinate.from_key(ex_k)
+            if hasattr(ase, "is_entity_critical"):
+                if ase.is_entity_critical(coord_ex.entity_id) or ase.is_entity_critical(ex_k):
+                    is_rule_melted = True
+                    is_ex_rule = False  # Zdejmij dogmatyczną obronę reguły
 
-        # Sort all candidates descending by score (never take first dictionary match)
-        candidates.sort(key=lambda c: c.score, reverse=True)
-        return candidates
+        ctx["is_ex_rule"] = is_ex_rule
+        ctx["is_rule_melted"] = is_rule_melted
+        if is_in_rule and is_ex_rule:
+            score += 35.0
+        elif is_ex_rule:
+            score += 15.0
+        elif is_rule_melted:
+            score += 25.0
+        if ex_k.startswith("mnemosyne:"):
+            score -= 40.0
+        ov = ctx["ov"]
+        score += 15.0 * len(ov["specific_overlap"])
+        score += 10.0 * len(ov["specific_stem_overlap"])
+        score += 5.0 * len(ov["token_overlap"])
+        score += ctx["ex_conf"] * 5.0
+        return score
+
+    def _scan_cross_key(self, ex_k, ex_val, ex_val_lower, ex_conf, ex_meta, key, val, incoming):
+        """Case B: relacja miedzy roznymi kluczami. Guard clauses -> wczesne zwroty None."""
+        if self._skip_episodic(ex_k):
+            return None
+
+        exp = self._existing_profile(ex_k, ex_val_lower)
+
+        if self._orthogonal_envs(incoming["env"], exp["env"]):
+            return None
+
+        coord_in = EpistemicCoordinate.from_key(key)
+        coord_ex = EpistemicCoordinate.from_key(ex_k)
+
+        # Multi-valued slots (tags, allowed_users, etc.) on distinct keys coexist without conflict
+        if ex_k != key and (
+            EpistemicDecisionKernel.is_multi_valued_slot(coord_in)
+            or EpistemicDecisionKernel.is_multi_valued_slot(coord_ex)
+        ):
+            return None
+
+        same_ns = self._same_namespace(key, ex_k, coord_in, coord_ex)
+
+        if self._orthogonal_tools(incoming["tools"], exp["tools"], same_ns):
+            return None
+
+        ov = self._overlap_measures(incoming, exp)
+        has_topic = self._has_topic_overlap(ov, same_ns)
+
+        shared_prohib = (incoming["prohibited"] & exp["prohibited"]) | {
+            t for t in incoming["prohibited"] if polish_stem(t) in exp["prohib_stems"]
+        }
+        if self._consensus_agreement(incoming, exp, shared_prohib):
+            return None
+
+        if not has_topic and not self._action_polarity_fallback(incoming, exp):
+            return None
+
+        ctx = {
+            "key": key, "ex_k": ex_k, "val": val, "ex_val": ex_val,
+            "ex_conf": ex_conf, "ex_meta": ex_meta, "same_ns": same_ns,
+            "ov": ov, "shared_prohib": shared_prohib, "in": incoming, "ex": exp,
+            "active_sensing_engine": self._get_active_sensing_engine(),
+        }
+        candidate_score = self._base_cross_score(ctx)
+        found = self._first_semantic_conflict(ctx)
+        if found is None:
+            return None
+        payload, bonus = found
+        is_rule_melted = ctx.get("is_rule_melted", False)
+        cand_meta = dict(ex_meta or {}) if is_rule_melted else ex_meta
+        if is_rule_melted:
+            cand_meta["is_rule_melted"] = True
+        return ArbitrationCandidate(
+            key=ex_k,
+            score=candidate_score + bonus,
+            reason=payload["reason"],
+            conflict_type=payload.get("conflict_type"),
+            conflicting_fact=payload.get("conflicting_fact"),
+            incoming_claim=payload.get("incoming_claim"),
+            overlapping_terms=list(payload.get("overlapping_terms") or []),
+            message=payload.get("message"),
+            confidence=ex_conf,
+            metadata=cand_meta,
+        )
+
+    # ── V117:detektory semantyczne (pierwszy trafiony wygrywa — kolejnosc zachowana) ──
+
+    def _first_semantic_conflict(self, ctx):
+        """Sekwencja V112-era: d1..d5 w starej kolejnosci; pierwszy znaleziony + bonus."""
+        for detector in (
+            self._detect_exclusivity_collision,
+            self._detect_prohibition_contradiction,
+            self._detect_capability_conflict,
+            self._detect_exclusivity_violation,
+            self._detect_polarity_contradiction,
+        ):
+            found = detector(ctx)
+            if found is not None:
+                return found
+        return None
+
+    @staticmethod
+    def _detect_exclusivity_collision(ctx):
+        """1. Wybpierajace się asekurecje exclusivity na wspolnym domenie (+40)."""
+        in_, ex = ctx["in"], ctx["ex"]
+        ov = ctx["ov"]
+        if not (in_["has_excl"] and ex["has_excl"]):
+            return None
+        actions_match = bool(in_["gov_actions"] & ex["gov_actions"])
+        targets_differ = bool(in_["excl_targets"] and ex["excl_targets"] and not (in_["excl_targets"] & ex["excl_targets"]))
+        differing = (in_["specific_tokens"] - ex["specific_tokens"]) | (ex["specific_tokens"] - in_["specific_tokens"])
+        near = ctx["same_ns"] or len(ov["specific_overlap"]) >= 1 or len(ov["stem_overlap"]) >= 1
+        if (actions_match and targets_differ) or (differing and near):
+            return (
+                {
+                    "reason": "exclusivity_collision",
+                    "conflict_type": "exclusivity_collision",
+                    "conflicting_fact": ctx["ex_val"],
+                    "incoming_claim": str(ctx["val"]),
+                    "overlapping_terms": list(ov["token_overlap"] or ov["stem_overlap"] or in_["excl_targets"]),
+                    "message": f"Incoming exclusivity assertion contradicts established exclusivity rule '{ctx['ex_k']}'.",
+                },
+                40.0,
+            )
+        return None
+
+    @staticmethod
+    def _detect_prohibition_contradiction(ctx):
+        """2. Przychodzacy asertuje akcje zabroniona w pamieci (+35)."""
+        in_, ex = ctx["in"], ctx["ex"]
+        if not (ex["has_prohib"] and not in_["has_prohib"]):
+            return None
+        prohibited_overlap = (
+            (in_["specific_tokens"] & ex["prohibited"])
+            | {t for t in in_["specific_tokens"] if polish_stem(t) in ex["prohib_stems"]}
+        ) - ctx["shared_prohib"]
+        action_words = ("push", "commit", "zapis", "edit", "edycja", "bezpośrednio", "bezpośredni", "delete", "remove", "drop", "root", "hasło", "hasła", "secret", "secrets")
+        has_action_in_prohib = any(t in prohibited_overlap for t in action_words)
+        near = len(prohibited_overlap) >= 2 or has_action_in_prohib or ctx["same_ns"]
+        if prohibited_overlap and near:
+            return (
+                {
+                    "reason": "semantic_contradiction",
+                    "conflict_type": "prohibition_contradiction",
+                    "conflicting_fact": ctx["ex_val"],
+                    "incoming_claim": str(ctx["val"]),
+                    "overlapping_terms": list(prohibited_overlap),
+                    "message": f"Incoming write asserts action prohibited by established memory '{ctx['ex_k']}'.",
+                },
+                35.0,
+            )
+        return None
+
+    @staticmethod
+    def _detect_capability_conflict(ctx):
+        """3. Przychodzacy zabrania capability ustalonej w pamieci (+30)."""
+        in_, ex = ctx["in"], ctx["ex"]
+        ov = ctx["ov"]
+        if not (in_["has_prohib"] and not ex["has_prohib"] and ex["has_aff"]):
+            return None
+        prohibited_overlap = (
+            (ex["specific_tokens"] & in_["prohibited"])
+            | {t for t in ex["specific_tokens"] if polish_stem(t) in in_["prohib_stems"]}
+        ) - ctx["shared_prohib"]
+        near = ctx.get("is_ex_rule") or len(ov["specific_overlap"]) >= 1 or ctx["same_ns"]
+        if prohibited_overlap and near:
+            return (
+                {
+                    "reason": "semantic_contradiction",
+                    "conflict_type": "prohibition_contradiction",
+                    "conflicting_fact": ctx["ex_val"],
+                    "incoming_claim": str(ctx["val"]),
+                    "overlapping_terms": list(prohibited_overlap),
+                    "message": f"Incoming write prohibits capability established in memory '{ctx['ex_k']}'.",
+                },
+                30.0,
+            )
+        return None
+
+    @staticmethod
+    def _detect_exclusivity_violation(ctx):
+        """4. Ustalone exclusivity naruszone przez alternatywny target przychodzacego (+35)."""
+        in_, ex = ctx["in"], ctx["ex"]
+        ov = ctx["ov"]
+        if not (ex["has_excl"] and not in_["has_excl"]):
+            return None
+        shared_actions = in_["gov_actions"] & ex["gov_actions"]
+        near = bool(shared_actions) or (ctx["same_ns"] and len(ov["specific_overlap"]) >= 1)
+        if not near:
+            return None
+        overlap_stems = ov["stem_overlap"]
+        authorized_targets = (ex["topic_tokens"] - {t for t in ex["topic_tokens"] if polish_stem(t) in overlap_stems}) - ex["prohibited"]
+        incoming_targets = in_["tokens"] - {t for t in in_["tokens"] if polish_stem(t) in overlap_stems}
+        violates = bool(incoming_targets and not (incoming_targets & authorized_targets)) or bool(in_["tokens"] & ex["prohibited"])
+        if not violates:
+            return None
+        return (
+            {
+                "reason": "exclusivity_violation",
+                "conflict_type": "exclusivity_violation",
+                "conflicting_fact": ctx["ex_val"],
+                "incoming_claim": str(ctx["val"]),
+                "overlapping_terms": list(ov["token_overlap"] or ov["stem_overlap"]),
+                "message": f"Incoming assertion violates established exclusive rule '{ctx['ex_k']}'.",
+            },
+            35.0,
+        )
+
+    @staticmethod
+    def _detect_polarity_contradiction(ctx):
+        """5. Bezposrednia polaryzacja: zakaz vs afirmacja (+25)."""
+        in_, ex = ctx["in"], ctx["ex"]
+        ov = ctx["ov"]
+        negates_established = in_["has_prohib"] and ex["has_aff"] and not ex["has_prohib"]
+        negates_incoming = in_["has_aff"] and ex["has_prohib"] and not in_["has_prohib"]
+        if not (negates_established or negates_incoming):
+            return None
+        if len(ov["specific_overlap"]) >= 2 or (ctx["same_ns"] and len(ov["token_overlap"]) >= 2):
+            return (
+                {
+                    "reason": "semantic_contradiction",
+                    "conflict_type": "semantic_contradiction",
+                    "conflicting_fact": ctx["ex_val"],
+                    "incoming_claim": str(ctx["val"]),
+                    "overlapping_terms": list(ov["token_overlap"] or ov["stem_overlap"]),
+                    "message": f"Incoming write contradicts established memory '{ctx['ex_k']}'.",
+                },
+                25.0,
+            )
+        return None
 
     def arbitrate(
         self,
@@ -509,25 +823,32 @@ class ConflictArbiter:
         source_type = str(meta.get("source_type") or meta.get("source") or "user_explicit")
         is_user_explicit = (source_type == "user_explicit" or (confidence >= self.confidence_threshold and source_type != "agent_inference"))
 
-        # Belief Revision Engine
-        # If incoming write is user_explicit with confidence >= 0.95 and colliding candidate has confidence <= incoming
-        is_both_rules = (key.startswith(("rule:", "preference:", "constraint:")) and best_candidate.key.startswith(("rule:", "preference:", "constraint:")))
-        has_topic_match = bool(best_candidate.score >= 35.0 or best_candidate.key == key or is_both_rules)
-        if (
+        is_explicit_supersede = bool(
             best_candidate.reason == "belief_revision"
-            or (
-                is_user_explicit
-                and confidence >= self.confidence_threshold
-                and best_candidate.confidence <= confidence
-                and (
-                    best_candidate.key == key
-                    or meta.get("supersedes") == best_candidate.key
-                    or meta.get("is_belief_revision") is True
-                    or meta.get("action") == "supersede"
-                    or (has_topic_match and best_candidate.reason in ("exclusivity_collision", "exclusivity_violation", "semantic_contradiction", "prohibition_contradiction"))
-                )
-            )
-        ):
+            or meta.get("supersedes") == best_candidate.key
+            or meta.get("is_belief_revision") is True
+            or meta.get("action") == "supersede"
+        )
+
+        is_rule_melted = bool(
+            best_candidate.metadata.get("is_rule_melted")
+            or meta.get("is_rule_melted")
+        )
+
+        kernel_action = EpistemicDecisionKernel.decide(
+            incoming_key=key,
+            existing_key=best_candidate.key,
+            is_user_explicit=is_user_explicit,
+            incoming_conf=confidence,
+            existing_conf=best_candidate.confidence,
+            conf_threshold=self.confidence_threshold,
+            best_score=best_score,
+            reason=best_candidate.reason,
+            is_explicit_supersede=is_explicit_supersede,
+            is_rule_melted=is_rule_melted,
+        )
+
+        if kernel_action == "supersede":
             return ArbitrationResult(
                 is_conflict=False,
                 is_belief_revision=True,

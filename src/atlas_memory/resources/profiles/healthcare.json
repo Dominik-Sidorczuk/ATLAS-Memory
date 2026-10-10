@@ -1,0 +1,30 @@
+{
+  "profile_name": "healthcare_oncology",
+  "version": "1.0.0",
+  "description": "Medical, Pharmacology and Oncology Screening Domain Profile",
+  "custom_predicates": {
+    "consists_of": {
+      "transitive": false,
+      "symmetry": false
+    },
+    "requires_condition": {
+      "criticality": "HIGH"
+    },
+    "has_dosage": {
+      "transitive": false
+    }
+  },
+  "structural_rules": [
+    {
+      "pattern": "(?:screeningu?|screening)(?:\\s+onkologiczn\\w*)?\\s*\\(([^)]+)\\)",
+      "parent_template": "Screening onkologiczny",
+      "rel_label": "consists_of"
+    }
+  ],
+  "entities": [],
+  "critical_keywords": [
+    "dose", "mg", "per_dose", "overdose", "dosage", "tumor", "hepatotoxic",
+    "lethal", "poison", "toxic", "toxicity", "diminishing_returns"
+  ]
+}
+

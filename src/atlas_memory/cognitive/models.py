@@ -10,26 +10,29 @@ Clean, strictly typed Pydantic v2 models for:
 
 from __future__ import annotations
 
-import math
 import time
 from typing import Any, Dict, List, Optional
 
 from pydantic import BaseModel, ConfigDict, Field
 
-HERMES_DEFAULT_SESSION: str = "hermes_default"
-HERMES_GLOBAL_SESSION: str = "global"
+from atlas_memory.core.models import (
+    HERMES_DEFAULT_SESSION,
+    HERMES_GLOBAL_SESSION,
+    clamp_conf,
+)
 
-
-def clamp_conf(val: Any) -> float:
-    """Klampuje wartość zaufania/pewności (confidence) do przedziału [0.0, 1.0]."""
-    try:
-        raw = float(val if val is not None else 1.0)
-        if math.isnan(raw):
-            raw = 1.0
-    except (ValueError, TypeError):
-        raw = 1.0
-    return max(0.0, min(1.0, raw))
-
+__all__ = [
+    "ArbitrationCandidate",
+    "ArbitrationResult",
+    "PredictionVerdict",
+    "PredictionDiscrepancy",
+    "RetrievalRecord",
+    "RetrievalContext",
+    "HotBufferEntry",
+    "HERMES_DEFAULT_SESSION",
+    "HERMES_GLOBAL_SESSION",
+    "clamp_conf",
+]
 
 
 class ArbitrationCandidate(BaseModel):
@@ -62,7 +65,7 @@ class ArbitrationResult(BaseModel):
     reason: Optional[str] = Field(default=None, description="Classification of conflict or revision")
     message: Optional[str] = Field(default=None, description="Descriptive diagnostic message")
     warning: Optional[str] = Field(default=None, description="Warning tag emitted (e.g. 'epistemic_conflict')")
-    conflict_details: Optional[Dict[str, Any]] = Field(default=None, description="Detailed dictionary for legacy caller compatibility")
+    conflict_details: Optional[Dict[str, Any]] = Field(default=None, description="Detailed dictionary of conflict parameters and diagnostics")
     candidates: List[ArbitrationCandidate] = Field(default_factory=list, description="All evaluated candidates sorted descending by score")
     best_candidate: Optional[ArbitrationCandidate] = Field(default=None, description="Top-scoring candidate")
     best_score: float = Field(default=0.0, description="Highest score among candidates")

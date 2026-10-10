@@ -1,7 +1,7 @@
 from pathlib import Path
 
-from atlas_memory.arrow_buffer.trajectory_buffer import ArrowTrajectoryBuffer
-from atlas_memory.models import ActionPlan, LatentState, PredictedTransition
+from atlas_memory.core.models import ActionPlan, LatentState, PredictedTransition
+from atlas_memory.l1_working.trajectory_buffer import ArrowTrajectoryBuffer
 
 
 def _create_sample_transition(step: int, dim: int = 16) -> PredictedTransition:

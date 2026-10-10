@@ -30,6 +30,13 @@ class EnergyModule:
         "alter", "truncate", "poweroff", "flush", "destroy",
     }
 
+    COMMON_NON_VOLATILE: Set[str] = {
+        "triggers", "depends_on", "relies_on", "hosts", "hosted_on", "powers",
+        "routes_to", "critical_for", "requires", "authenticates", "mounts",
+        "databases", "causes", "specifies", "leads_to", "stated_memory",
+        "read", "query", "observe", "inspect", "get", "view", "check", "status",
+    }
+
     def __init__(
         self,
         active_sensing: Optional[Any] = None,
@@ -72,9 +79,18 @@ class EnergyModule:
             ]
             base_cost = max(relevant_errors) if relevant_errors else 0.1
         else:
-            # Heurystyka oparta na naturze akcji
+            # Cognitive assessment: O(1) string check first, followed by SemanticRiskAssessor
             act_lower = str(action).lower()
-            is_volatile = any(va in act_lower for va in self.VOLATILE_ACTIONS)
+            if any(va in act_lower for va in self.VOLATILE_ACTIONS):
+                is_volatile = True
+            elif act_lower in self.COMMON_NON_VOLATILE:
+                is_volatile = False
+            else:
+                try:
+                    from atlas_memory.causal.risk_assessor import SemanticRiskAssessor
+                    is_volatile = SemanticRiskAssessor.get_instance().is_volatile(act_lower)
+                except Exception:
+                    is_volatile = False
             base_cost = 0.5 if is_volatile else 0.1
 
         # 2. Modyfikacja przez confidence jeśli podano
@@ -141,13 +157,13 @@ class EnergyModule:
         critical_conf_sum = sum(e.confidence for e in critical_edges)
         total_conf_sum = sum(e.confidence for e in relevant_edges)
 
-        # Współczynnik ryzyka:
-        # - Stopień wyjścia (węzeł z wieloma zależnościami jest potencjalnym CPoF)
-        # - Odsetek i waga krytycznych relacji
-        branching_factor = min(1.0, num_outgoing / 5.0)
-        critical_ratio = min(1.0, max(0.0, critical_conf_sum / max(1e-5, total_conf_sum))) if total_conf_sum > 0 else 0.0  # clamp01 scope: nie-confidence (waga/penalty)
+        # Obliczenie wpływu na spójność/osiągalność grafu (V154 Filar III)
+        # Obiektywna miara wpływu węzła na topologię: reachability/out-degree impact oraz waga relacji krytycznych
+        known_nodes_count = len(edges) if isinstance(edges, (dict, list)) else max(1, num_outgoing)
+        reachability_impact = min(1.0, num_outgoing / max(1.0, float(known_nodes_count)))
+        critical_ratio = min(1.0, max(0.0, critical_conf_sum / max(1e-5, total_conf_sum))) if total_conf_sum > 0 else 0.0
 
-        raw_risk = (0.5 * critical_ratio) + (0.3 * branching_factor) + (0.2 * min(1.0, critical_conf_sum / 3.0))
+        raw_risk = max(reachability_impact, critical_ratio * min(1.0, num_outgoing / 2.0))
         if not math.isfinite(raw_risk):
             raw_risk = 0.0
 
@@ -171,18 +187,43 @@ class EnergyModule:
         Gradient dE/dw:
         dE/dw = c_cost - (1 - c_cost) * (1 - critic) + 2 * lambda_reg * (w - 0.5)
         """
-        c_cost = await self.intrinsic_cost(edge.source, edge.predicate, current_confidence=edge.confidence)
-        critic = await self.trainable_critic(edge.target, edges=edges_context)
-
+        # Pobranie bazowego kosztu i uwzględnienie zależności c_cost od wagi w
+        bc = await self.intrinsic_cost(edge.source, edge.predicate, current_confidence=None)
         w = clamp_conf(edge.confidence)
 
-        # Obliczenie energii
-        align_term = w * c_cost + (1.0 - w) * (1.0 - c_cost) * (1.0 - critic)
+        if bc > 0.4:
+            raw_cost = bc * (0.8 + 0.4 * w)
+            cost = min(1.0, raw_cost)
+            dc_dw = 0.4 * bc if raw_cost < 1.0 else 0.0
+        else:
+            raw_cost = bc * (1.2 - 0.4 * w)
+            cost = max(0.0, raw_cost)
+            dc_dw = -0.4 * bc if raw_cost > 0.0 else 0.0
+
+        if not math.isfinite(cost):
+            cost = 0.1
+            dc_dw = 0.0
+
+        c_cost = float(max(0.0, min(1.0, cost)))
+        critic = await self.trainable_critic(edge.target, edges=edges_context)
+        k = 1.0 - critic
+
+        # Obliczenie energii:
+        # E_e(w) = w * c_cost + (1 - w) * (1 - c_cost) * (1 - critic) + lambda_reg * (w - 0.5)^2
+        align_term = w * c_cost + (1.0 - w) * (1.0 - c_cost) * k
         reg_term = lambda_reg * ((w - 0.5) ** 2)
         energy = align_term + reg_term
 
-        # Gradient
-        grad = c_cost - ((1.0 - c_cost) * (1.0 - critic)) + 2.0 * lambda_reg * (w - 0.5)
+        # Pełny gradient wg reguły iloczynu:
+        # d/dw [w * c_cost(w)] = c_cost + w * dc_dw
+        # d/dw [(1 - w) * (1 - c_cost(w)) * k] = -(1 - c_cost)*k - (1 - w)*k*dc_dw
+        # d/dw [lambda_reg * (w - 0.5)^2] = 2 * lambda_reg * (w - 0.5)
+        grad = (
+            c_cost
+            - (1.0 - c_cost) * k
+            + 2.0 * lambda_reg * (w - 0.5)
+            + dc_dw * (w - (1.0 - w) * k)
+        )
 
         if not math.isfinite(energy):
             energy = 1.0

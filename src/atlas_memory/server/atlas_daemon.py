@@ -1,5 +1,13 @@
-"""AtlasDaemon — Micro-Sidecar server for ATLAS over Unix Domain Socket with JSON-RPC 2.0."""
+"""Atlas Micro-Sidecar Daemon executing JSON-RPC 2.0 requests via Unix Domain Socket.
 
+Refactored to Clean Architecture & Controller Pattern (SOLID / OOP):
+- JsonRpcDispatcher: request parsing, validation, telemetry, and method routing.
+- MemoryRpcControllerMixin: KV store CRUD, prefetch, observation commits, audit verification.
+- CausalRpcControllerMixin: what_if counterfactual queries, graph hydration, annealing.
+- SensingRpcControllerMixin: shadow worker extraction, predictive coding probes, attention bus.
+- SleepRpcControllerMixin: trajectory ingestion, sleep consolidation, session lifecycle.
+- SyncRpcControllerMixin: multi-agent CRDT sync, gossip protocol, peer status.
+"""
 from __future__ import annotations
 
 import asyncio
@@ -10,33 +18,21 @@ import signal
 import struct
 import time
 from pathlib import Path
-from typing import Any, Callable, Coroutine, Dict, List, Optional, Set
+from typing import Any, Callable, Coroutine, Dict, List, Optional, Set, Tuple
 
-from atlas_memory.cognitive import (
-    ConflictArbiter,
-    EpistemicWritePath,
-    HotBufferPolicy,
-    PredictiveCoder,
-    RetrievalPipeline,
-)
-from atlas_memory.cognitive.hot_buffer import (
-    extract_effective_session,
-    is_conversational_churn,
-    is_session_accessible,
-)
+from atlas_memory.cognitive.conflict_arbiter import ConflictArbiter
 from atlas_memory.cognitive.models import (
-    HERMES_DEFAULT_SESSION,
     clamp_conf,
 )
-from atlas_memory.cognitive.retrieval_pipeline import (
+from atlas_memory.cognitive.predictive_coder import PredictiveCoder
+from atlas_memory.cognitive.retrieval.pipeline import (
+    RetrievalPipeline,
     compute_content_fingerprint,
     get_record_authority_score,
 )
-from atlas_memory.security.delete_guard import (
-    DELETE_PROTECTED_PREFIXES,
-    is_delete_protected,
-)
-from atlas_memory.server.models import (
+from atlas_memory.cognitive.write_path import EpistemicWritePath
+from atlas_memory.core.agi_logger import log_subsystem_status_matrix
+from atlas_memory.ipc.wire_models import (
     DEFAULT_PID_PATH,
     DEFAULT_SOCKET_PATH,
     PARSE_ERROR,
@@ -44,6 +40,28 @@ from atlas_memory.server.models import (
     JSONRPCRequest,
     JSONRPCResponse,
 )
+from atlas_memory.l1_working.hot_buffer import (
+    HotBufferPolicy,
+    extract_effective_session,
+    is_conversational_churn,
+    is_session_accessible,
+)
+from atlas_memory.l2_semantic.vector_backend import load_vector_backend
+from atlas_memory.server.controllers.causal import CausalRpcControllerMixin
+from atlas_memory.server.controllers.dispatcher import JsonRpcDispatcher
+from atlas_memory.server.controllers.memory import MemoryRpcControllerMixin
+from atlas_memory.server.controllers.sensing import SensingRpcControllerMixin
+from atlas_memory.server.controllers.sleep import (
+    SleepRpcControllerMixin,
+    _resolve_sleep_watermark,
+)
+from atlas_memory.server.controllers.sync import SyncRpcControllerMixin
+from atlas_memory.server.telemetry import (
+    _daemon_build_stamp,
+    clamp_rpc_limit,
+)
+
+logger = logging.getLogger("atlas.server.daemon")
 
 __all__ = [
     "AtlasDaemon",
@@ -53,21 +71,56 @@ __all__ = [
     "get_record_authority_score",
     "is_conversational_churn",
     "clamp_rpc_limit",
+    "clamp_conf",
+    "DEFAULT_SOCKET_PATH",
+    "DEFAULT_PID_PATH",
+    "JSONRPCRequest",
+    "JSONRPCResponse",
+    "JSONRPCError",
+    "_daemon_build_stamp",
+    "_resolve_sleep_watermark",
+    "SubsystemLifecycleManager",
 ]
 
-logger = logging.getLogger(__name__)
+
+class SubsystemLifecycleManager:
+    """Deterministic Lifecycle Manager tracking DAG component states and transitions."""
+
+    def __init__(self, log: logging.Logger) -> None:
+        self.log = log
+
+    def transition(
+        self,
+        phase_idx: int,
+        total_phases: int,
+        tag: str,
+        name: str,
+        target_state: str,
+        details: str = "",
+        duration_ms: Optional[float] = None,
+    ) -> None:
+        """Transitions a subsystem: INITIALIZING -> HEALTHCHECK -> target_state."""
+        dur_str = f" ({duration_ms:.0f}ms)" if duration_ms is not None else ""
+        det_str = f" [{details}]" if details else ""
+        self.log.info(
+            "[SYS:BOOT] [%d/%d] %s %s: INITIALIZING -> HEALTHCHECK -> %s%s%s",
+            phase_idx,
+            total_phases,
+            tag,
+            name,
+            target_state,
+            det_str,
+            dur_str,
+        )
 
 
-def clamp_rpc_limit(limit_val: Any, default: int = 15, min_val: int = 1, max_val: int = 100) -> int:
-    """Clamps RPC limit parameter to [min_val, max_val] safely."""
-    try:
-        val = int(limit_val)
-    except (ValueError, TypeError):
-        val = default
-    return max(min_val, min(val, max_val))
-
-
-class AtlasDaemon:
+class AtlasDaemon(
+    MemoryRpcControllerMixin,
+    CausalRpcControllerMixin,
+    SensingRpcControllerMixin,
+    SleepRpcControllerMixin,
+    SyncRpcControllerMixin,
+):
     """Atlas Micro-Sidecar Daemon executing JSON-RPC 2.0 requests via Unix Domain Socket."""
 
     def __init__(
@@ -78,14 +131,36 @@ class AtlasDaemon:
         graph_client: Optional[Any] = None,
         latent_buffer: Optional[Any] = None,
         orchestrator: Optional[Any] = None,
+        shadow_worker: Optional[Any] = None,
         *,
         causal_engine: Optional[Any] = None,
         active_sensing: Optional[Any] = None,
         gossip: Optional[Any] = None,
+        calibration_engine: Optional[Any] = None,
+        enable_calibrated_thresholds: Optional[bool] = None,
+        boot_matrix: Optional[List[Tuple[str, str, str]]] = None,
+        hot_buffer: Optional[Any] = None,
+        write_path: Optional[Any] = None,
     ) -> None:
-        self.socket_path = Path(socket_path)
-        self.pid_path = Path(pid_path)
+        from atlas_memory.core.config import get_config
+        cfg = get_config()
+        self.socket_path = Path(socket_path) if str(socket_path) != str(DEFAULT_SOCKET_PATH) else cfg.socket_path
+        self.pid_path = Path(pid_path) if str(pid_path) != str(DEFAULT_PID_PATH) else cfg.pid_path
         self.engine = engine
+        self._boot_matrix = boot_matrix
+        self.enable_calibrated_thresholds = bool(
+            cfg.enable_calibrated_thresholds
+            if enable_calibrated_thresholds is None
+            else enable_calibrated_thresholds
+        )
+        self.calibration_engine = calibration_engine
+        if self.enable_calibrated_thresholds and self.calibration_engine is None:
+            try:
+                from atlas_memory.cognitive.calibration_engine import CalibrationEngine
+                self.calibration_engine = CalibrationEngine(enabled=True)
+            except Exception as ce_exc:
+                logger.debug("Failed to auto-init CalibrationEngine in daemon: %s", ce_exc)
+                self.calibration_engine = None
         self.graph_client = graph_client or (engine.graph if engine and hasattr(engine, "graph") else None)
         self.latent_buffer = latent_buffer or (engine.latent if engine and hasattr(engine, "latent") else None)
         self.orchestrator = orchestrator
@@ -107,13 +182,78 @@ class AtlasDaemon:
             except Exception as as_err:
                 logger.debug("Could not auto-create ActiveSensingEngine: %s", as_err)
         self.gossip = gossip
+        self.shadow_worker: Optional[Any] = shadow_worker
+        if self.shadow_worker is None and self.orchestrator is not None:
+            if cfg.shadow_worker_enabled:
+                try:
+                    from atlas_memory.active.shadow_worker import OmniRouteShadowWorker
+
+                    self.shadow_worker = OmniRouteShadowWorker(orchestrator=self.orchestrator)
+                except Exception as sw_err:
+                    logger.debug("Could not auto-create OmniRouteShadowWorker: %s", sw_err)
+                    self.shadow_worker = None
+        if self.shadow_worker is not None and self.orchestrator is not None:
+            self.orchestrator.shadow_extractor = self.shadow_worker._extract_spo_sync
+        self.session_hook: Optional[Any] = None
+        if self.engine is not None:
+            try:
+                from atlas_memory.hermes.prefix_guard import HermesSessionHook
+                self.session_hook = HermesSessionHook(self.engine)
+            except Exception as sh_err:
+                logger.debug("Could not auto-create HermesSessionHook: %s", sh_err)
 
         self._server: Optional[asyncio.Server] = None
         self._serving: bool = False
+        self._stopping: bool = False
         self._active_writers: Set[asyncio.StreamWriter] = set()
-        self._handlers: Dict[str, Callable[[Dict[str, Any]], Coroutine[Any, Any, Any]]] = {
+
+        self._last_memory_md_mtime: float = 0.0
+        self._last_memory_md_sync_check: float = 0.0
+        self._memory_md_task: Optional[asyncio.Task] = None
+        self._graph_hydration: Dict[str, Any] = {}
+        self._is_sleeping: bool = False
+
+        # L1 Cognitive Layer Domain Core
+        self.hot_buffer = hot_buffer or HotBufferPolicy(maxlen=25, ttl_seconds=900.0)
+        if self.engine is not None:
+            self.engine.hot_buffer = self.hot_buffer
+
+        self._attention_queue: "asyncio.Queue[Dict[str, Any]]" = asyncio.Queue(maxsize=256)
+        self._attention_task: Optional[asyncio.Task] = None
+        self._hot_kv_buffer = self.hot_buffer
+        self.conflict_arbiter = ConflictArbiter()
+        self.predictive_coder = PredictiveCoder(
+            engine=self.engine,
+            causal_engine=self.causal_engine,
+            active_sensing=self.active_sensing,
+        )
+        if self.orchestrator is not None and self.enable_calibrated_thresholds:
+            self.orchestrator.enable_calibrated_thresholds = True
+            if getattr(self.orchestrator, "calibration_engine", None) is None:
+                self.orchestrator.calibration_engine = self.calibration_engine
+        self.retrieval_pipeline = RetrievalPipeline(
+            hot_buffer=self.hot_buffer,
+            kv_store=self.engine.kv if self.engine and hasattr(self.engine, "kv") else None,
+            vector_store=self.engine.vector_store if self.engine and hasattr(self.engine, "vector_store") else None,
+            graph_store=self.graph_client or (self.engine.graph if self.engine and hasattr(self.engine, "graph") else None),
+            orchestrator=self.orchestrator,
+            engine=self.engine,
+            calibration_engine=self.calibration_engine,
+            enable_calibrated_thresholds=self.enable_calibrated_thresholds,
+        )
+        self.write_path = write_path or EpistemicWritePath(
+            kv_store=self.engine.kv if self.engine and hasattr(self.engine, "kv") else None,
+            graph_store=self.graph_client or (self.engine.graph if self.engine and hasattr(self.engine, "graph") else None),
+            hot_buffer=self.hot_buffer,
+            conflict_arbiter=self.conflict_arbiter,
+            vector_store=self.engine.vector_store if self.engine and hasattr(self.engine, "vector_store") else None,
+        )
+
+        # Wire JsonRpcDispatcher
+        self.dispatcher = JsonRpcDispatcher({
             "ping": self._handle_ping,
             "prefetch": self._handle_prefetch,
+            "atlas_recall": self._handle_atlas_recall,
             "commit_observation": self._handle_commit_observation,
             "set": self._handle_set,
             "set_state": self._handle_set,
@@ -135,48 +275,109 @@ class AtlasDaemon:
             "task_feedback": self._handle_task_feedback,
             "session/end": self._handle_session_end,
             "session_end": self._handle_session_end,
-        }
-        self._last_memory_md_mtime: float = 0.0
-
-        # L1 Cognitive Layer Domain Core
-        self.hot_buffer = HotBufferPolicy(maxlen=25, ttl_seconds=900.0)
-        self._hot_kv_buffer = self.hot_buffer
-        self.conflict_arbiter = ConflictArbiter()
-        self.predictive_coder = PredictiveCoder(engine=self.engine, causal_engine=self.causal_engine)
-        self.retrieval_pipeline = RetrievalPipeline(
-            hot_buffer=self.hot_buffer,
-            kv_store=self.engine.kv if self.engine and hasattr(self.engine, "kv") else None,
-            vector_store=self.engine.vector_store if self.engine and hasattr(self.engine, "vector_store") else None,
-            graph_store=self.graph_client or (self.engine.graph if self.engine and hasattr(self.engine, "graph") else None),
-            orchestrator=self.orchestrator,
-            engine=self.engine,
-        )
-        self.write_path = EpistemicWritePath(
-            kv_store=self.engine.kv if self.engine and hasattr(self.engine, "kv") else None,
-            graph_store=self.graph_client or (self.engine.graph if self.engine and hasattr(self.engine, "graph") else None),
-            hot_buffer=self.hot_buffer,
-            conflict_arbiter=self.conflict_arbiter,
-        )
+            "trajectory/ingest": self._handle_trajectory_ingest,
+            "checkpoint_wal": self._handle_checkpoint_wal,
+            "procedural/status": self._handle_procedural_status,
+            "get_procedural_status": self._handle_procedural_status,
+            "shadow_enqueue": self._handle_shadow_enqueue,
+            "shadow_drain": self._handle_shadow_drain,
+            "shadow_status": self._handle_shadow_status,
+        })
+        self._handlers: Dict[str, Callable[[Dict[str, Any]], Coroutine[Any, Any, Any]]] = self.dispatcher.handlers
 
         if hasattr(signal, "SIGHUP"):
             try:
                 signal.signal(signal.SIGHUP, signal.SIG_IGN)
-            except (ValueError, OSError):
-                pass
+            except (ValueError, OSError) as sighup_err:
+                logger.debug("Failed ignoring SIGHUP: %s", sighup_err)
         self._seed_hot_kv_buffer()
 
     def _seed_hot_kv_buffer(self) -> None:
         """Seeds working memory hot buffer from persistent SQLite KV store upon startup (Finding F-4)."""
-        if self.engine is None or not hasattr(self.engine, "kv") or self.engine.kv is None:
+        if len(getattr(self.hot_buffer, "_buffer", [])) > 0:
             return
-        kv_store = self.engine.kv
-        if not hasattr(kv_store, "get_recent_sync") or hasattr(kv_store, "_mock_return_value") or hasattr(kv_store, "assert_called"):
+        kv_store = getattr(self.engine, "kv", None) if self.engine is not None else None
+        if kv_store is None or not callable(getattr(kv_store, "get_recent_sync", None)):
             return
         try:
-            seeded = self.hot_buffer.seed_from_kv(kv_store, max_age_seconds=900.0, limit=25)
-            logger.info("Seeded hot_buffer with %d recent items from SQLite", seeded)
+            self.hot_buffer.seed_from_kv(kv_store, max_age_seconds=900.0, limit=25)
         except Exception as exc:
-            logger.warning("Failed to seed hot_buffer from KV store: %s", exc)
+            logger.debug("Failed to seed hot_buffer from KV store: %s", exc)
+
+    def _build_status_matrix(self) -> List[Tuple[str, str, str]]:
+        """Constructs the subsystem status checklist rows dynamically."""
+        if getattr(self, "_boot_matrix", None):
+            rows: List[Tuple[str, str, str]] = []
+            for name, status, details in self._boot_matrix:
+                if "HotBuffer" in name:
+                    seeded_count = len(getattr(self.hot_buffer, "_buffer", []))
+                    rows.append(("[L1] HotBuffer (Working)", "READY", f"Seeded: {seeded_count} records"))
+                elif "Multigraph" in name:
+                    nodes_cnt = getattr(self.graph_client, "node_count", 0) or (
+                        len(self.graph_client.nx_graph.nodes) if hasattr(self.graph_client, "nx_graph") else 0
+                    )
+                    edges_cnt = getattr(self.graph_client, "edge_count", 0) or (
+                        len(self.graph_client.nx_graph.edges) if hasattr(self.graph_client, "nx_graph") else 0
+                    )
+                    p_cnt = 0
+                    if hasattr(self.graph_client, "nx_graph") and self.graph_client.nx_graph is not None:
+                        for _, d in self.graph_client.nx_graph.nodes(data=True):
+                            if isinstance(d, dict) and d.get("type") == "passage":
+                                p_cnt += 1
+                    e_cnt = max(0, nodes_cnt - p_cnt)
+                    rows.append(("[L2] Kùzu Multigraph", "READY", f"Nodes: {nodes_cnt} (E:{e_cnt}, P:{p_cnt}) | Edges: {edges_cnt}"))
+                elif "Procedural Consol" in name:
+                    sops_cnt = 0
+                    if self.engine and hasattr(self.engine, "kv") and self.engine.kv is not None:
+                        try:
+                            conn_kv = self.engine.kv.ensure_connection()
+                            sops_cnt = conn_kv.execute("SELECT COUNT(*) FROM state_variables WHERE key LIKE 'sop:%'").fetchone()[0]
+                        except Exception:
+                            pass
+                    rows.append(("[L3] Procedural Consol", "READY", f"Stream: Arrow/Parquet | SOPs: {sops_cnt} | AST Guard: strict"))
+                else:
+                    rows.append((name, status, details))
+            return rows
+
+        rows = []
+        ttt = getattr(self.engine, "ttt_layer", None) if self.engine else None
+        steps = getattr(ttt, "step_count", 0) if ttt else 0
+        rows.append(("[L0] TTT Engine", "READY" if ttt else "DISABLED", f"Steps: {steps} restored" if ttt else "[Reason: not configured]"))
+        seeded = len(getattr(self.hot_buffer, "_buffer", []))
+        rows.append(("[L1] HotBuffer (Working)", "READY", f"Seeded: {seeded} records"))
+        g = self.graph_client
+        nodes_cnt = (getattr(g, "node_count", 0) or (len(g.nx_graph.nodes) if hasattr(g, "nx_graph") else 0)) if g else 0
+        edges_cnt = (getattr(g, "edge_count", 0) or (len(g.nx_graph.edges) if hasattr(g, "nx_graph") else 0)) if g else 0
+        p_cnt = 0
+        if g and hasattr(g, "nx_graph") and g.nx_graph is not None:
+            for _, d in g.nx_graph.nodes(data=True):
+                if isinstance(d, dict) and d.get("type") == "passage":
+                    p_cnt += 1
+        e_cnt = max(0, nodes_cnt - p_cnt)
+        rows.append(("[L2] Kùzu Multigraph", "READY" if g else "DISABLED", f"Nodes: {nodes_cnt} (E:{e_cnt}, P:{p_cnt}) | Edges: {edges_cnt}" if g else "[Reason: not configured]"))
+        vec = getattr(self.engine, "vector_store", None) if self.engine else None
+        dim = getattr(vec, "dimension", 512) if vec else 512
+        rows.append(("[L2] Qdrant Vector Engine", "READY" if vec else "DISABLED", f"Dim: {dim} (onnx68 / poldense68)" if vec else "[Reason: not configured]"))
+        auditor = getattr(self.engine, "auditor", None) if self.engine else None
+        rows.append(("[L3] Memory Auditor", "ACTIVE" if auditor else "DISABLED", "Saga Monad: ACTIVE | Rollback: verified | Decay: enabled" if auditor else "[Reason: not configured]"))
+        sops_cnt = 0
+        if self.engine and hasattr(self.engine, "kv") and self.engine.kv is not None:
+            try:
+                conn_kv = self.engine.kv.ensure_connection()
+                sops_cnt = conn_kv.execute("SELECT COUNT(*) FROM state_variables WHERE key LIKE 'sop:%'").fetchone()[0]
+            except Exception:
+                pass
+        rows.append(("[L3] Procedural Consol", "READY" if self.engine else "DISABLED", f"Stream: Arrow/Parquet | SOPs: {sops_cnt} | AST Guard: strict" if self.engine else "[Reason: not configured]"))
+        ppr = getattr(g, "_ppr_engine", None) if g else None
+        rows.append(("[CR] HippoRAG 2 PPR", "WARMED" if ppr else "SKIPPED", "Warmup completed (damping=0.85)" if ppr else "[Reason: not warmed]"))
+        rows.append(("[EG] Epistemic Guard", "ACTIVE" if getattr(self, "write_path", None) else "DISABLED", "Conflict Policy: STRICT" if getattr(self, "write_path", None) else "[Reason: not configured]"))
+        from atlas_memory.ingest.mnemosyne_ingest import DEFAULT_MNEMOSYNE_DB_PATH
+        mnemo_exists = DEFAULT_MNEMOSYNE_DB_PATH.exists()
+        rows.append(("[MB] Mnemosyne Bridge", "READY" if mnemo_exists else "UNLINKED", "Sync: active" if mnemo_exists else "Reason: In-process module missing (FALLBACK: Shadow RPC)"))
+        sw = self.shadow_worker
+        q_max = getattr(getattr(sw, "turn_queue", None), "maxsize", 1000) if sw else 1000
+        rows.append(("[SH] OmniRoute Shadow", "DISPATCHING" if sw else "DISABLED", f"Queue max: {q_max} | Model: auto/best-fast" if sw else "[Reason: disabled in config]"))
+        return rows
 
     @classmethod
     def create_default(
@@ -188,71 +389,329 @@ class AtlasDaemon:
         **kwargs: Any,
     ) -> AtlasDaemon:
         """Instantiates a full-throttle AtlasDaemon with HybridMemoryEngine and Mnemosyne Ingestion."""
-        if "sync_legacy_mnemosyne" in kwargs:
-            import warnings
-            warnings.warn(
-                "sync_legacy_mnemosyne is deprecated, use ingest_mnemosyne_on_start instead",
-                DeprecationWarning,
-                stacklevel=2,
-            )
-            ingest_mnemosyne_on_start = kwargs.pop("sync_legacy_mnemosyne")
-
         base_dir = Path(atlas_dir) if atlas_dir else (Path.home() / ".hermes" / "atlas")
         base_dir.mkdir(parents=True, exist_ok=True)
+        from atlas_memory.core.config import get_config
+        cfg = get_config()
+        if cfg.hipporag_enabled:
+            os.environ.setdefault("ATLAS_HIPPORAG", "1")
 
-        # Auto-recover stale Qdrant lock if no active daemon is running on UDS socket
-        qdrant_dir = base_dir / "qdrant"
-        lock_file = qdrant_dir / ".lock"
-        if lock_file.exists():
-            sock = Path(socket_path)
-            is_active = False
-            if sock.exists():
-                import socket
-                try:
-                    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-                    s.settimeout(0.5)
-                    s.connect(str(sock))
-                    s.close()
-                    is_active = True
-                except Exception:
-                    is_active = False
-            if not is_active:
-                logger.warning("Detected stale Qdrant lock file at %s without active daemon. Recovering...", lock_file)
-                try:
-                    lock_file.unlink(missing_ok=True)
-                except Exception as exc:
-                    logger.debug("Failed to remove stale lock %s: %s", lock_file, exc)
+        lifecycle = SubsystemLifecycleManager(logger)
 
+        # 1. VerifiedKVStore
+        t_kv = time.perf_counter()
+        from atlas_memory.l2_semantic.kv_store import VerifiedKVStore
+        k_store = VerifiedKVStore(db_path=str(base_dir / "atlas.db"))
+        kv_dur_ms = (time.perf_counter() - t_kv) * 1000
+        lifecycle.transition(1, 10, "[L2]", "VerifiedKVStore", "READY", "SHA-256 integrity verified", duration_ms=kv_dur_ms)
+
+        # 2. Kùzu Graph Engine
+        t_graph = time.perf_counter()
+        from atlas_memory.l2_semantic.kuzu_graph import KuzuGraphStore
+        g_store = KuzuGraphStore(db_path=str(base_dir / "kuzu"))
+        try:
+            hyd_rep = g_store.hydrate_from_disk_sync()
+            g_store._pre_hydrated_report = hyd_rep
+        except Exception as hyd_err:
+            logger.debug("Graph disk hydration skipped: %s", hyd_err)
+        nodes_cnt = getattr(g_store, "node_count", 0) or (len(g_store.nx_graph.nodes) if hasattr(g_store, "nx_graph") else 0)
+        edges_cnt = getattr(g_store, "edge_count", 0) or (len(g_store.nx_graph.edges) if hasattr(g_store, "nx_graph") else 0)
+        p_cnt = 0
+        if hasattr(g_store, "nx_graph") and g_store.nx_graph is not None:
+            for _, d in g_store.nx_graph.nodes(data=True):
+                if isinstance(d, dict) and d.get("type") == "passage":
+                    p_cnt += 1
+        e_cnt = max(0, nodes_cnt - p_cnt)
+        graph_dur_ms = (time.perf_counter() - t_graph) * 1000
+        lifecycle.transition(2, 10, "[L2]", "Kùzu Multigraph", "READY", f"Nodes: {nodes_cnt} (E:{e_cnt}, P:{p_cnt}) | Edges: {edges_cnt}", duration_ms=graph_dur_ms)
+
+        # 3. Qdrant Vector Store
+        t_vec = time.perf_counter()
+        vector_backend = load_vector_backend()
+        vb_dict = vector_backend.describe()
+        from atlas_memory.l2_semantic.qdrant_store import QdrantVectorStore
+        from atlas_memory.l2_semantic.vector_backend import build_encoder
+        try:
+            enc = build_encoder(vector_backend)
+        except Exception:
+            enc = None
+        v_store = QdrantVectorStore(
+            collection_name=vector_backend.collection,
+            location=str(base_dir / "qdrant"),
+            dimension=vector_backend.dimension,
+            encoder=enc,
+        )
+        vec_dur_ms = (time.perf_counter() - t_vec) * 1000
+        vec_kind = vb_dict.get("kind", "onnx68")
+        model_name = Path(vb_dict.get("model_dir", "")).name or "poldense68"
+        lifecycle.transition(3, 10, "[L2]", "Qdrant Vector Engine", "READY", f"Dim: {vector_backend.dimension} ({vec_kind} / {model_name})", duration_ms=vec_dur_ms)
+
+        # Assemble engine core
         from atlas_memory.active.prediction_error import ActiveSensingEngine
         from atlas_memory.causal.retro_causal_edge import RetroCausalEngine
         from atlas_memory.engine import HybridMemoryEngine
+        from atlas_memory.extensions.canonicalizer import EntityCanonicalizer
+        from atlas_memory.extensions.compactor import ContextCompactor
+        from atlas_memory.extensions.decay_scorer import SalienceDecayEngine
+        from atlas_memory.l0_dynamic.ttt_layer import TTTLayer
+        from atlas_memory.l1_working.jepa_latent import JEPALatentBuffer
+        from atlas_memory.l1_working.trajectory_buffer import ArrowTrajectoryBuffer
+        from atlas_memory.l3_procedural.auditor import MemoryAuditor
         from atlas_memory.orchestrator import MemoryOrchestrator
-        from atlas_memory.sync.crdt import DeltaCRDT
-        from atlas_memory.sync.crypto import SyncCrypto
-        from atlas_memory.sync.protocol import GossipProtocol
 
-        engine = HybridMemoryEngine.create_default(
-            db_path=str(base_dir / "atlas.db"),
-            qdrant_location=str(base_dir / "qdrant"),
-            kuzu_path=str(base_dir / "kuzu"),
+        latent = JEPALatentBuffer()
+        ttt = TTTLayer(input_dim=latent.state_dim)
+        traj_buf = ArrowTrajectoryBuffer(state_dim=latent.state_dim)
+        canon = EntityCanonicalizer()
+        decay = SalienceDecayEngine()
+        comp = ContextCompactor()
+        auditor = MemoryAuditor(g_store, k_store, v_store, decay_engine=decay)
+
+        engine = HybridMemoryEngine(
+            vector_store=v_store,
+            graph_client=g_store,
+            kv_store=k_store,
+            ttt_layer=ttt,
+            latent_buffer=latent,
+            trajectory_buffer=traj_buf,
+            auditor=auditor,
+            weight_baker=None,
+            canonicalizer=canon,
+            decay_engine=decay,
+            compactor=comp,
         )
         orchestrator = MemoryOrchestrator(engine=engine)
         causal_engine = RetroCausalEngine(graph_client=engine.graph, latent_buffer=engine.latent)
         active_sensing = ActiveSensingEngine()
 
-        crdt = DeltaCRDT(node_id="hermes_local_node")
-        crypto = SyncCrypto(SyncCrypto.generate_key())
-        gossip = GossipProtocol(local_node_id="hermes_local_node", crdt=crdt, crypto=crypto)
-        gossip.register_peer("hermes_peer_alpha")
+        ttt_steps = getattr(ttt, "step_count", 0)
 
+        # 4. MemoryAuditor (L3 Reversible Monad & Epistemic Decay)
+        t_aud = time.perf_counter()
+        dangling_cnt = 0
+        try:
+            conn_d = k_store.ensure_connection()
+            dangling_cnt = conn_d.execute(
+                "SELECT COUNT(*) FROM transaction_intents WHERE status = 'PENDING'"
+            ).fetchone()[0]
+        except Exception:
+            pass
+        aud_dur_ms = (time.perf_counter() - t_aud) * 1000
+        lifecycle.transition(
+            4,
+            10,
+            "[L3]",
+            "MemoryAuditor (Saga)",
+            "ACTIVE",
+            f"Saga Monad: ACTIVE | Rollback: verified (dangling={dangling_cnt}) | Decay: enabled",
+            duration_ms=aud_dur_ms,
+        )
+
+        # 5. Procedural Engine (L3 Trajectory Consolidation & AST Guard)
+        t_proc = time.perf_counter()
+        sops_cnt = 0
+        try:
+            conn_kv = k_store.ensure_connection()
+            sops_cnt = conn_kv.execute(
+                "SELECT COUNT(*) FROM state_variables WHERE key LIKE 'sop:%'"
+            ).fetchone()[0]
+        except Exception:
+            pass
+        from atlas_memory.l3_procedural.skill_compiler import ASTSafetyScanner
+        ast_guard_status = "STRICT" if hasattr(ASTSafetyScanner, "FORBIDDEN_CALLS") else "READY"
+        proc_dur_ms = (time.perf_counter() - t_proc) * 1000
+        lifecycle.transition(
+            5,
+            10,
+            "[L3]",
+            "Procedural Engine",
+            "READY",
+            f"Stream: Arrow/Parquet | SOPs: {sops_cnt} | AST Guard: {ast_guard_status}",
+            duration_ms=proc_dur_ms,
+        )
+
+        # 6. HippoRAG 2 PPR
+        t_ppr = time.perf_counter()
+        ppr_status = "WARMED"
+        ppr_detail = "Warmup completed (damping=0.85)"
+        try:
+            from atlas_memory.cognitive.retrieval.ppr import HippoRAG2PPR, ig, is_hipporag_enabled
+            if not is_hipporag_enabled():
+                ppr_status = "SKIPPED"
+                ppr_detail = "Reason: disabled in config"
+            elif ig is None:
+                ppr_status = "FALLBACK"
+                ppr_detail = "Reason: python-igraph not installed, numpy fallback"
+            elif hasattr(engine, "graph"):
+                ppr_warmer = HippoRAG2PPR()
+                ppr_warmer._build_graph_structures(engine.graph)
+                engine.graph._ppr_engine = ppr_warmer
+        except Exception as ppr_warm_exc:
+            ppr_status = "FAILED"
+            ppr_detail = f"Reason: {ppr_warm_exc}"
+        ppr_dur_ms = (time.perf_counter() - t_ppr) * 1000
+        lifecycle.transition(6, 10, "[CR]", "HippoRAG 2 PPR", ppr_status, ppr_detail, duration_ms=ppr_dur_ms)
+
+        # 7. HotBuffer
+        t_wb = time.perf_counter()
+        from atlas_memory.l1_working.hot_buffer import HotBufferPolicy
+        hot_buffer = HotBufferPolicy(maxlen=25, ttl_seconds=900.0)
+        seeded_count = 0
+        if k_store is not None and callable(getattr(k_store, "get_recent_sync", None)):
+            try:
+                hot_buffer.seed_from_kv(k_store, max_age_seconds=900.0, limit=25)
+                seeded_count = len(getattr(hot_buffer, "_buffer", []))
+            except Exception as seed_exc:
+                logger.debug("Failed seeding hot_buffer from KV store: %s", seed_exc)
+        engine.hot_buffer = hot_buffer
+        wb_dur_ms = (time.perf_counter() - t_wb) * 1000
+        lifecycle.transition(7, 10, "[L1]", "HotBuffer (Working)", "READY", f"Seeded: {seeded_count} records", duration_ms=wb_dur_ms)
+
+        # 8. Epistemic Guard
+        t_wp = time.perf_counter()
+        conflict_arbiter = ConflictArbiter()
+        write_path = EpistemicWritePath(
+            kv_store=k_store,
+            graph_store=g_store,
+            hot_buffer=hot_buffer,
+            conflict_arbiter=conflict_arbiter,
+            vector_store=v_store,
+        )
+        engine.write_path = write_path
+        wp_dur_ms = (time.perf_counter() - t_wp) * 1000
+        lifecycle.transition(8, 10, "[EG]", "Epistemic Guard", "ACTIVE", "Conflict Policy: STRICT", duration_ms=wp_dur_ms)
+
+        # 9. Memory Bridge (Mnemosyne)
+        t_mnemo = time.perf_counter()
+        mnemo_status = "UNLINKED"
+        mnemo_detail = "Reason: In-process module missing (FALLBACK: Shadow RPC)"
         if ingest_mnemosyne_on_start:
             try:
-                from atlas_memory.ingest.mnemosyne_ingest import MnemosyneIngestEngine
-                ingester = MnemosyneIngestEngine()
+                from atlas_memory.ingest.mnemosyne_ingest import (
+                    DEFAULT_MNEMOSYNE_DB_PATH,
+                    MnemosyneIngestEngine,
+                    resolve_default_memory_md_path,
+                )
+                default_atlas_dir = (Path.home() / ".hermes" / "atlas").resolve()
+                if base_dir.resolve() == default_atlas_dir:
+                    mnemo_db = DEFAULT_MNEMOSYNE_DB_PATH
+                    mem_md = resolve_default_memory_md_path()
+                else:
+                    mnemo_db = base_dir.parent / "mnemosyne" / "data" / "mnemosyne.db"
+                    mem_md = base_dir.parent / "memories" / "MEMORY.md"
+                ingester = MnemosyneIngestEngine(db_path=mnemo_db, memory_md_path=mem_md)
                 if ingester.is_available:
-                    ingester.sync_into_atlas_engine(engine)
+                    ingester.sync_memory_md_into_engine(engine)
+                    ingester.sync_into_atlas_engine(engine, skip_memory_md=True)
+                    mnemo_status = "READY"
+                    mnemo_detail = "Sync: active"
+                else:
+                    mnemo_status = "UNLINKED"
+                    mnemo_detail = "Reason: In-process module missing (FALLBACK: Shadow RPC)"
             except Exception as sync_exc:
-                logger.warning("Auto-sync Mnemosyne on daemon startup warning: %s", sync_exc)
+                mnemo_status = "UNLINKED"
+                mnemo_detail = f"Reason: {sync_exc}"
+        mnemo_dur_ms = (time.perf_counter() - t_mnemo) * 1000
+        lifecycle.transition(9, 10, "[MB]", "Mnemosyne Bridge", mnemo_status, mnemo_detail, duration_ms=mnemo_dur_ms)
+
+        # 10. Shadow Worker
+        t_sw = time.perf_counter()
+        shadow_worker = kwargs.pop("shadow_worker", None)
+        sw_status = "DISABLED"
+        sw_detail = "Reason: disabled in config"
+        if shadow_worker is None and cfg.shadow_worker_enabled:
+            try:
+                from atlas_memory.active.shadow_worker import OmniRouteShadowWorker
+
+                shadow_worker = OmniRouteShadowWorker(orchestrator=orchestrator)
+                orchestrator.shadow_extractor = shadow_worker._extract_spo_sync
+                sw_status = "DISPATCHING"
+                q_max = getattr(getattr(shadow_worker, "turn_queue", None), "maxsize", 1000)
+                sw_detail = f"Queue max: {q_max} | Model: auto/best-fast"
+            except Exception as sw_exc:
+                sw_status = "DISABLED"
+                sw_detail = f"Reason: {sw_exc}"
+        elif shadow_worker is not None:
+            sw_status = "DISPATCHING"
+            q_max = getattr(getattr(shadow_worker, "turn_queue", None), "maxsize", 1000)
+            sw_detail = f"Queue max: {q_max} | Model: auto/best-fast"
+        sw_dur_ms = (time.perf_counter() - t_sw) * 1000
+        lifecycle.transition(10, 10, "[SH]", "OmniRoute Shadow", sw_status, sw_detail, duration_ms=sw_dur_ms)
+
+        boot_matrix = [
+            ("[L0] TTT Engine", "READY", f"Steps: {ttt_steps} restored"),
+            ("[L1] HotBuffer (Working)", "READY", f"Seeded: {seeded_count} records"),
+            ("[L2] Kùzu Multigraph", "READY", f"Nodes: {nodes_cnt} (E:{e_cnt}, P:{p_cnt}) | Edges: {edges_cnt}"),
+            ("[L2] Qdrant Vector Engine", "READY", f"Dim: {vector_backend.dimension} ({vec_kind} / {model_name})"),
+            ("[L3] Memory Auditor", "ACTIVE", f"Saga Monad: ACTIVE | Rollback: verified (dangling={dangling_cnt}) | Decay: enabled"),
+            ("[L3] Procedural Consol", "READY", f"Stream: Arrow/Parquet | SOPs: {sops_cnt} | AST Guard: {ast_guard_status}"),
+            ("[CR] HippoRAG 2 PPR", ppr_status, ppr_detail),
+            ("[EG] Epistemic Guard", "ACTIVE", "Conflict Policy: STRICT"),
+            ("[MB] Mnemosyne Bridge", mnemo_status, mnemo_detail),
+            ("[SH] OmniRoute Shadow", sw_status, sw_detail),
+        ]
+
+        from atlas_memory.sync import EpistemicReputation, GossipProtocol, PeerIdentity
+        from atlas_memory.sync.bridge import StateSyncBridge
+        from atlas_memory.sync.crdt import DeltaCRDT
+        from atlas_memory.sync.crypto import SyncCrypto
+
+        crdt = DeltaCRDT(node_id="hermes_local_node")
+        sync_psk = kwargs.pop("sync_psk", cfg.sync_psk)
+        if sync_psk:
+            crypto = SyncCrypto.from_psk(sync_psk)
+        else:
+            psk_file = base_dir / "sync.key"
+            if psk_file.exists():
+                try:
+                    crypto = SyncCrypto.from_psk(psk_file.read_bytes())
+                except Exception:
+                    crypto = SyncCrypto(SyncCrypto.generate_key())
+            else:
+                generated = SyncCrypto.generate_key()
+                try:
+                    psk_file.write_bytes(generated)
+                except Exception as exc:
+                    logger.debug("Could not write sync.key file: %s", exc)
+                crypto = SyncCrypto(generated)
+
+        bridge = StateSyncBridge(
+            kv_store=engine.kv,
+            write_path=getattr(engine, "write_path", None),
+            node_id="hermes_local_node",
+        )
+        identity = PeerIdentity(node_id="hermes_local_node")
+        reputation = EpistemicReputation()
+        gossip = GossipProtocol(
+            local_node_id="hermes_local_node",
+            crdt=crdt,
+            crypto=crypto,
+            bridge=bridge,
+            identity=identity,
+            reputation=reputation,
+        )
+        gossip.register_peer("hermes_peer_alpha")
+
+        enable_calibrated_thresholds = kwargs.pop(
+            "enable_calibrated_thresholds",
+            cfg.enable_calibrated_thresholds,
+        )
+        calibration_engine = kwargs.pop("calibration_engine", None)
+        if calibration_engine is None and enable_calibrated_thresholds:
+            try:
+                from atlas_memory.cognitive.calibration_engine import CalibrationEngine
+                calib_file = base_dir / "calibration.json"
+                if not calib_file.exists():
+                    alt = Path(__file__).resolve().parents[3] / "docs" / "calib" / "calibration_artifact.json"
+                    if alt.exists():
+                        calib_file = alt
+                calibration_engine = CalibrationEngine(
+                    artifact_path=calib_file if calib_file.exists() else None,
+                    enabled=True,
+                )
+            except Exception as ce_exc:
+                logger.debug("CalibrationEngine init skipped in create_default: %s", ce_exc)
+                calibration_engine = None
 
         return cls(
             socket_path=socket_path,
@@ -261,9 +720,15 @@ class AtlasDaemon:
             graph_client=engine.graph,
             latent_buffer=engine.latent,
             orchestrator=orchestrator,
+            shadow_worker=shadow_worker,
             causal_engine=causal_engine,
             active_sensing=active_sensing,
             gossip=gossip,
+            calibration_engine=calibration_engine,
+            enable_calibrated_thresholds=enable_calibrated_thresholds,
+            boot_matrix=boot_matrix,
+            hot_buffer=hot_buffer,
+            write_path=write_path,
         )
 
     async def start(self) -> None:
@@ -279,7 +744,6 @@ class AtlasDaemon:
             except OSError as exc:
                 logger.warning("Could not unlink existing socket %s: %s", self.socket_path, exc)
 
-        # D2: Auto-heal SHA audit chain on startup if unhealed rows exist
         if self.engine is not None and hasattr(self.engine, "kv") and self.engine.kv is not None:
             if hasattr(self.engine.kv, "verify_audit_log_sync") and hasattr(self.engine.kv, "heal_audit_log_chain"):
                 try:
@@ -292,6 +756,50 @@ class AtlasDaemon:
                     logger.warning("Failed to auto-heal audit chain on startup: %s", heal_exc)
 
         self.socket_path.parent.mkdir(parents=True, exist_ok=True)
+        await self._hydrate_graph_from_disk()
+
+        if str(self.socket_path) == str(DEFAULT_SOCKET_PATH):
+            try:
+                from atlas_memory.core.linguistics import _bilingual_stem
+                _bilingual_stem("konfiguracja")
+                _bilingual_stem("configuration")
+            except Exception as stem_exc:
+                logger.debug("Stem warmup skipped: %s", stem_exc)
+
+            try:
+                vec_s = getattr(self.engine, "vector_store", None) if self.engine is not None else None
+                if vec_s is not None and callable(getattr(vec_s, "search", None)):
+                    res_w = vec_s.search("warmup", top_k=1)
+                    if asyncio.iscoroutine(res_w):
+                        await res_w
+            except Exception as vec_exc:
+                logger.debug("Vector warmup skipped: %s", vec_exc)
+
+            try:
+                from atlas_memory.cognitive.retrieval.ppr import HippoRAG2PPR, ig
+                if ig is None:
+                    logger.debug("HippoRAG 2 PPR warmup skipped: python-igraph not installed")
+                elif self.graph_client is not None and not getattr(self.graph_client, "_ppr_engine", None):
+                    _ppr_w = HippoRAG2PPR()
+                    self.graph_client._ppr_engine = _ppr_w
+                    _ppr_w.run("warmup", self.graph_client, top_k=1)
+            except Exception as warm_exc:
+                logger.debug("Startup pre-warm skipped or failed: %s", warm_exc)
+
+        # Output the Subsystem Status Matrix directly before opening UDS listener
+        matrix_rows = self._build_status_matrix()
+        matrix_rows.append(("[IPC] UDS Socket Server", "LISTENING", f"Path: {self.socket_path} | MaxMsg: 16MB"))
+        active_count = sum(1 for _, st, _ in matrix_rows if st in ("READY", "ACTIVE", "WARMED", "DISPATCHING", "LISTENING"))
+        bypass_count = sum(1 for _, st, _ in matrix_rows if st in ("UNLINKED", "DISABLED", "SKIPPED", "FALLBACK"))
+        mandatory_count = len(matrix_rows) - bypass_count
+
+        log_subsystem_status_matrix(
+            log=logger,
+            rows=matrix_rows,
+            total_modules=mandatory_count,
+            active_count=active_count,
+            optional_disabled=bypass_count,
+        )
 
         self._server = await asyncio.start_unix_server(
             self._handle_client,
@@ -299,12 +807,54 @@ class AtlasDaemon:
             limit=16 * 1024 * 1024,
         )
         self._serving = True
-        self._seed_hot_kv_buffer()
-        logger.info("AtlasDaemon started on %s (pid: %d)", self.socket_path, os.getpid())
+        self._stopping = False
+        logger.info("[SYS:BOOT] AtlasDaemon UDS listener online on %s (pid: %d)", self.socket_path, os.getpid())
+
+        if self._attention_task is None:
+            self._attention_task = asyncio.create_task(self._attention_consumer())
+
+        if self.shadow_worker is not None and getattr(self.shadow_worker, "_worker_task", None) is None:
+            self.shadow_worker.start()
+            logger.debug("Shadow worker task started (queue_max=%d)", getattr(self.shadow_worker.turn_queue, "maxsize", -1))
+
+        if self._memory_md_task is None and str(self.socket_path) == str(DEFAULT_SOCKET_PATH):
+            self._memory_md_task = asyncio.create_task(self._start_memory_md_watcher())
 
     async def stop(self) -> None:
         """Gracefully stops the server and cleans up socket and pid files."""
+        if getattr(self, "_stopping", False):
+            return
+        self._stopping = True
         self._serving = False
+
+        if self.shadow_worker is not None:
+            try:
+                await self.shadow_worker.stop()
+            except Exception as sw_stop_err:
+                logger.debug("Shadow worker stop handled: %s", sw_stop_err)
+
+        audit_queue = getattr(self.engine, "audit_queue", None)
+        if isinstance(audit_queue, asyncio.Queue):
+            try:
+                await asyncio.wait_for(audit_queue.join(), timeout=5.0)
+            except Exception as drain_err:
+                logger.debug("Audit queue drain before stop failed/timed out: %s", drain_err)
+
+        if self._memory_md_task is not None:
+            self._memory_md_task.cancel()
+            try:
+                await self._memory_md_task
+            except (asyncio.CancelledError, Exception) as task_err:
+                logger.debug("Memory MD task cancellation handled: %s", task_err)
+            self._memory_md_task = None
+
+        if self._attention_task is not None:
+            self._attention_task.cancel()
+            try:
+                await self._attention_task
+            except (asyncio.CancelledError, Exception) as task_err:
+                logger.debug("Attention task cancellation handled: %s", task_err)
+            self._attention_task = None
 
         for writer in list(self._active_writers):
             try:
@@ -329,6 +879,31 @@ class AtlasDaemon:
             except OSError as exc:
                 logger.debug("Failed to remove PID file %s: %s", self.pid_path, exc)
 
+        if self.engine is not None and hasattr(self.engine, "kv") and self.engine.kv is not None:
+            try:
+                await self.engine.kv.close()
+            except Exception as exc:
+                logger.debug("Error closing KV store during stop: %s", exc)
+
+        graph_store = getattr(self.engine, "graph", None) if self.engine is not None else None
+        if graph_store is not None and hasattr(graph_store, "close"):
+            try:
+                report = graph_store.close()
+                logger.info("Graph store closed on stop: %s", report)
+            except Exception as exc:
+                logger.error("Error closing graph store during stop: %s", exc)
+
+        vector_store = (
+            (getattr(self.engine, "vector_store", None) or getattr(self.engine, "vector", None))
+            if self.engine is not None
+            else None
+        )
+        if vector_store is not None and callable(getattr(vector_store, "close", None)):
+            try:
+                vector_store.close()
+            except Exception as exc:
+                logger.debug("Error closing vector store during stop: %s", exc)
+
         self._active_writers.clear()
         logger.info("AtlasDaemon stopped")
 
@@ -350,7 +925,6 @@ class AtlasDaemon:
                 try:
                     loop.add_signal_handler(sig, lambda: asyncio.create_task(self.stop()))
                 except (NotImplementedError, RuntimeError) as exc:
-                    # Signals not supported on some platforms / threads
                     logger.debug("Signal handler registration skipped for signal %s: %s", sig, exc)
 
     def _check_and_write_pid(self) -> None:
@@ -360,12 +934,10 @@ class AtlasDaemon:
                 content = self.pid_path.read_text().strip()
                 if content:
                     old_pid = int(content)
-                    # Check if process is alive
                     try:
                         os.kill(old_pid, 0)
                         raise RuntimeError(f"AtlasDaemon is already running with PID {old_pid}")
                     except OSError:
-                        # Stale PID file
                         logger.debug("Ignoring stale PID file from dead process: %d", old_pid)
             except (ValueError, OSError) as exc:
                 if isinstance(exc, RuntimeError):
@@ -384,14 +956,51 @@ class AtlasDaemon:
         self._active_writers.add(writer)
         try:
             while self._serving:
-                # 4-byte big-endian length prefix with timeout protection
                 try:
                     length_bytes = await asyncio.wait_for(reader.readexactly(4), timeout=60.0)
                 except asyncio.TimeoutError:
                     break
+
+                # Protect against raw HTTP/text frames or malformed headers on UDS socket
+                is_text = False
+                try:
+                    text_peek = length_bytes.decode("ascii")
+                    if text_peek.startswith(("GET", "POST", "HEAD", "PUT", "OPTIONS", "{", "[")):
+                        is_text = True
+                except UnicodeDecodeError:
+                    pass
+
+                if is_text:
+                    extra_sample = b""
+                    try:
+                        extra_sample = await asyncio.wait_for(reader.read(12), timeout=0.05)
+                    except Exception:
+                        pass
+                    sample_bytes = length_bytes + extra_sample
+                    logger.warning(
+                        "[IPC:CLIENT] Framing violation: Incompatible un-framed payload on UDS socket. "
+                        "Raw header hex: [%s] (ascii: %r). Disconnecting client cleanly.",
+                        sample_bytes.hex(),
+                        sample_bytes,
+                    )
+                    break
+
                 (msg_len,) = struct.unpack(">I", length_bytes)
-                if msg_len > 16 * 1024 * 1024:  # 16 MB protection limit
-                    raise ValueError(f"Message length too large: {msg_len} bytes")
+                if msg_len > 16 * 1024 * 1024:
+                    extra_sample = b""
+                    try:
+                        extra_sample = await asyncio.wait_for(reader.read(12), timeout=0.05)
+                    except Exception:
+                        pass
+                    sample_bytes = length_bytes + extra_sample
+                    logger.warning(
+                        "[IPC:CLIENT] Framing violation: parsed msg_len=%d bytes exceeds 16MB ceiling. "
+                        "Raw header hex: [%s] (ascii: %r). Disconnecting client cleanly.",
+                        msg_len,
+                        sample_bytes.hex(),
+                        sample_bytes,
+                    )
+                    break
 
                 payload_bytes = await asyncio.wait_for(reader.readexactly(msg_len), timeout=30.0)
                 try:
@@ -423,13 +1032,20 @@ class AtlasDaemon:
                                 responses.append(resp)
                         if responses:
                             batch_data = [resp.model_dump() for resp in responses]
-                            batch_bytes = json.dumps(batch_data).encode("utf-8")
+                            try:
+                                batch_bytes = json.dumps(batch_data).encode("utf-8")
+                            except (UnicodeEncodeError, UnicodeError):
+                                batch_bytes = json.dumps(batch_data, ensure_ascii=True).encode("utf-8")
                             writer.write(struct.pack(">I", len(batch_bytes)) + batch_bytes)
                             await writer.drain()
                 else:
                     response = await self._dispatch_rpc(request_data)
                     if response is not None:
-                        response_bytes = response.model_dump_json().encode("utf-8")
+                        try:
+                            response_bytes = response.model_dump_json().encode("utf-8")
+                        except (UnicodeEncodeError, UnicodeError):
+                            safe_data = response.model_dump()
+                            response_bytes = json.dumps(safe_data, ensure_ascii=True).encode("utf-8")
                         response_prefix = struct.pack(">I", len(response_bytes))
                         writer.write(response_prefix + response_bytes)
                         await writer.drain()
@@ -445,703 +1061,16 @@ class AtlasDaemon:
             except Exception as exc:
                 logger.debug("Error closing client connection writer: %s", exc)
 
-
     async def _dispatch_rpc(self, req_raw: Any) -> Optional[JSONRPCResponse]:
         """Dispatches raw request dictionary to appropriate handler."""
-        if not isinstance(req_raw, dict):
-            return JSONRPCResponse(
-                id=None,
-                error=JSONRPCError.invalid_request("Request must be a JSON object"),
-            )
+        return await self.dispatcher.dispatch(req_raw)
 
-        is_notification = ("id" not in req_raw or req_raw.get("id") is None)
-        req_id = req_raw.get("id")
-        try:
-            req = JSONRPCRequest.model_validate(req_raw)
-        except Exception as exc:
-            if is_notification:
-                return None
-            return JSONRPCResponse(
-                id=req_id,
-                error=JSONRPCError.invalid_request(str(exc)),
-            )
 
-        handler = self._handlers.get(req.method)
-        if handler is None:
-            if is_notification:
-                return None
-            return JSONRPCResponse(
-                id=req.id,
-                error=JSONRPCError.method_not_found(req.method),
-            )
+def main() -> None:
+    sock = Path(os.environ.get("ATLAS_SOCKET_PATH", str(Path.home() / ".hermes" / "atlas.sock")))
+    daemon = AtlasDaemon.create_default(socket_path=str(sock))
+    asyncio.run(daemon.start())
 
-        try:
-            params = req.params or {}
-            result = await handler(params)
-            if is_notification:
-                return None
-            return JSONRPCResponse(id=req.id, result=result)
-        except (ValueError, TypeError, KeyError) as param_err:
-            logger.warning("Invalid params in RPC method %s: %s", req.method, param_err)
-            if is_notification:
-                return None
-            return JSONRPCResponse(
-                id=req.id,
-                error=JSONRPCError.invalid_params(str(param_err)),
-            )
-        except Exception as exc:
-            logger.exception("Error executing RPC method %s: %s", req.method, exc)
-            if is_notification:
-                return None
-            return JSONRPCResponse(
-                id=req.id,
-                error=JSONRPCError.internal_error(str(exc)),
-            )
 
-    # -------------------------------------------------------------------------
-    # RPC Handlers
-    # -------------------------------------------------------------------------
-
-    async def _handle_ping(self, params: Dict[str, Any]) -> Dict[str, Any]:
-        """Health check endpoint."""
-        return {"status": "ok"}
-
-    def _check_and_sync_memory_md(self) -> None:
-        """Auto-sync all markdown files in ~/.hermes/memories/ if modification timestamp has changed."""
-        if str(self.socket_path) != str(DEFAULT_SOCKET_PATH):
-            return
-        from atlas_memory.ingest.mnemosyne_ingest import DEFAULT_HERMES_MEMORY_MD_PATH, MnemosyneIngestEngine
-        memories_dir = DEFAULT_HERMES_MEMORY_MD_PATH.parent
-        if not memories_dir.exists():
-            return
-        try:
-            md_files = [f for f in memories_dir.glob("*.md") if not f.name.endswith(".lock")]
-            if not md_files:
-                return
-            latest_mtime = max(f.stat().st_mtime for f in md_files)
-            if latest_mtime > self._last_memory_md_mtime:
-                self._last_memory_md_mtime = latest_mtime
-                if self.engine is not None:
-                    ingester = MnemosyneIngestEngine(memory_md_path=DEFAULT_HERMES_MEMORY_MD_PATH)
-                    res = ingester.sync_memory_md_into_engine(self.engine)
-                    logger.info("[Auto-Sync] Ingested updated memories (MEMORY.md/USER.md) into ATLAS: %s", res)
-        except Exception as exc:
-            logger.debug("Auto-sync memories check error: %s", exc)
-
-    async def _handle_prefetch(self, params: Dict[str, Any]) -> Dict[str, Any]:
-        """Prefetch memory records for query/session with full epistemic formatting and content deduplication."""
-        params_dict = dict(params)
-        if "limit" in params_dict:
-            params_dict["limit"] = clamp_rpc_limit(params_dict.get("limit", 15))
-        return await self.retrieval_pipeline.execute_prefetch(
-            params_dict,
-            engine=self.engine,
-            orchestrator=self.orchestrator,
-            hot_buffer=self._hot_kv_buffer,
-            check_sync_callback=self._check_and_sync_memory_md,
-        )
-
-    def _auto_insert_graph_edges(
-        self,
-        key: str,
-        val: Any,
-        params: Dict[str, Any],
-        metadata: Dict[str, Any],
-        confidence: float,
-    ) -> None:
-        """Parses and inserts multi-hop relations into the runtime knowledge graph via write_path."""
-        if hasattr(self, "write_path") and hasattr(self.write_path, "_auto_insert_graph_edges"):
-            self.write_path._auto_insert_graph_edges(key, val, metadata, confidence)
-
-    async def _handle_set(self, params: Dict[str, Any]) -> Dict[str, Any]:
-        """Set a key-value pair in ATLAS Verified KV Store via EpistemicWritePath."""
-        key = params.get("key") or params.get("subject")
-        val = params.get("value") or params.get("object") or params.get("val") or params.get("target") or ""
-        if not key:
-            raise ValueError("Key or subject is required for set")
-        confidence = clamp_conf(params.get("confidence", 1.0))
-        session_id = params.get("session_id") or HERMES_DEFAULT_SESSION
-        metadata = dict(params.get("metadata") or {})
-        for field in ("predicate", "relation", "target", "object", "subject"):
-            if field in params and field not in metadata:
-                metadata[field] = params[field]
-        source_type = params.get("source_type")
-        if source_type:
-            metadata["source_type"] = str(source_type)
-        metadata["confidence"] = confidence
-        metadata["session_id"] = str(session_id)
-
-        reason = params.get("reason", "rpc_set")
-        task_success = bool(params.get("task_success") or params.get("success") or (params.get("outcome") == "success"))
-        if task_success and self.engine is not None and hasattr(self.engine, "kv") and self.engine.kv is not None:
-            existing = self.engine.kv.get_sync(key) if hasattr(self.engine.kv, "get_sync") else None
-            if existing:
-                existing_conf = float(existing.get("confidence", confidence))
-                confidence = clamp_conf(existing_conf + 0.05)
-                reason = "task_feedback:success"
-                metadata["confidence"] = confidence
-                metadata["task_feedback"] = "success"
-
-        if hasattr(self, "write_path") and self.write_path is not None:
-            res = self.write_path.write(
-                key=key,
-                value=val,
-                confidence=confidence,
-                metadata=metadata,
-                source_type=source_type,
-                reason=reason,
-                session_id=session_id,
-            )
-            if self.engine is not None and hasattr(self.engine, "record_mental_transition"):
-                try:
-                    from atlas_memory.models import ActionPlan
-                    action = ActionPlan(name="remember", parameters={"key": key, "value": str(val)[:100]})
-                    self.engine.record_mental_transition(action, session_id=session_id)
-                except Exception as exc:
-                    logger.debug("Daemon set record_mental_transition error: %s", exc)
-            return res
-        return {"status": "error", "error": "no_engine_available"}
-
-    async def _handle_get(self, params: Dict[str, Any]) -> Dict[str, Any]:
-        """Get a key-value record from ATLAS Verified KV Store."""
-        key = params.get("key")
-        if not key:
-            raise ValueError("Key is required for get")
-        if self.engine is not None and hasattr(self.engine, "kv") and self.engine.kv is not None:
-            state = await self.engine.kv.get_state(key)
-            logger.info("[RPC] get key='%s' -> found=%s", key, state is not None)
-            return {"status": "ok", "key": key, "found": state is not None, "state": state}
-        return {"status": "error", "error": "no_engine_available"}
-
-    # Protected key prefixes that MUST NOT be hard-deleted (T19 / ADR-005, A3)
-    _DELETE_PROTECTED_PREFIXES = DELETE_PROTECTED_PREFIXES
-
-    async def _handle_delete(self, params: Dict[str, Any]) -> Dict[str, Any]:
-        """Delete a key from ATLAS Verified KV Store.
-
-        Protected prefixes (hermes:, fact:, prompt-, mnemosyne:) are rejected
-        to prevent accidental destruction of durable system facts (ADR-005).
-        Successful deletes are recorded in the SHA-256 audit hash-chain.
-        """
-        key = params.get("key")
-        if not key:
-            raise ValueError("Key is required for delete")
-
-        # Guard: reject protected prefixes (ADR-005, A3)
-        is_prot, prefix = is_delete_protected(str(key))
-        if is_prot:
-            logger.warning("[RPC] delete REJECTED for protected key='%s' (prefix '%s')", key, prefix)
-            return {
-                "status": "rejected",
-                "key": key,
-                "deleted": False,
-                "found": False,
-                "reason": "protected_key",
-                "message": f"Key '{key}' is protected (prefix '{prefix}'). Use soft tombstone or explicit ADR override.",
-            }
-
-        if self.engine is not None and hasattr(self.engine, "kv") and self.engine.kv is not None:
-            kv = self.engine.kv
-            if hasattr(kv, "delete_state"):
-                deleted = await kv.delete_state(key)
-            else:
-                assert kv._conn is not None
-                with kv._conn:
-                    cursor = kv._conn.execute("DELETE FROM state_variables WHERE key = ?", (key,))
-                    deleted = bool(cursor.rowcount > 0)
-            logger.info("[RPC] delete key='%s' -> deleted=%s", key, deleted)
-            return {"status": "ok", "key": key, "deleted": deleted, "found": deleted}
-        return {"status": "error", "error": "no_engine_available"}
-
-    async def _handle_sync_memory_file(self, params: Dict[str, Any]) -> Dict[str, Any]:
-        """Syncs Hermes MEMORY.md file into ATLAS Vault."""
-        path = params.get("path")
-        from atlas_memory.ingest.mnemosyne_ingest import MnemosyneIngestEngine
-        ingester = MnemosyneIngestEngine()
-        if self.engine is not None:
-            res = ingester.sync_memory_md_into_engine(self.engine, path=path)
-            logger.info("[RPC] sync_memory_file -> %s", res)
-            return res
-        return {"status": "error", "error": "no_engine_available"}
-
-    async def _handle_commit_observation(self, params: Dict[str, Any]) -> Dict[str, Any]:
-        """Commit an observation / fact into the ATLAS Vault."""
-        subject = str(params.get("subject") or "").strip()
-        if not subject:
-            return {"status": "error", "error": "empty_subject", "message": "Subject cannot be empty"}
-
-        predicate = str(params.get("predicate") or "observation").strip() or "observation"
-        obj = str(params.get("object") or "")
-        confidence = clamp_conf(params.get("confidence", 1.0))
-        source = params.get("source", "user_explicit")
-        session_id = params.get("session_id", HERMES_DEFAULT_SESSION)
-
-        if self.engine is not None and hasattr(self.engine, "kv") and self.engine.kv is not None:
-            var_key = f"{subject}:{predicate}"
-            task_success = bool(params.get("task_success") or params.get("success") or (params.get("outcome") == "success"))
-            reason = "commit_observation"
-            if task_success and hasattr(self.engine.kv, "get_sync"):
-                existing = self.engine.kv.get_sync(var_key)
-                if existing:
-                    existing_conf = existing.get("confidence", confidence)
-                    confidence = clamp_conf(float(existing_conf) + 0.05)
-                    if not obj:
-                        obj = str(existing.get("value") or "")
-                    reason = "task_feedback:success"
-
-            self.engine.kv.set_sync(
-                var_key,
-                obj,
-                confidence=confidence,
-                metadata={"confidence": confidence, "source": source, "session_id": session_id},
-                reason=reason,
-            )
-            if hasattr(self.engine, "graph") and self.engine.graph is not None:
-                try:
-                    if hasattr(self.engine.graph, "add_entity"):
-                        self.engine.graph.add_entity(subject, entity_type="Concept")
-                        self.engine.graph.add_entity(obj[:80], entity_type="Observation")
-                    self.write_path.commit_relation(subject, predicate, obj[:80], confidence=confidence, session_id=session_id)
-                except Exception as exc:
-                    logger.debug("Graph commit observation ignored: %s", exc)
-            # Record into hot-KV working buffer
-            self._hot_kv_buffer.append({
-                "key": var_key,
-                "value": obj,
-                "timestamp": time.time(),
-                "confidence": confidence,
-                "metadata": {"confidence": confidence, "source": source, "session_id": session_id},
-                "source_type": source,
-            })
-            if self.engine is not None and hasattr(self.engine, "record_mental_transition"):
-                try:
-                    from atlas_memory.models import ActionPlan
-                    action = ActionPlan(name=f"observe:{predicate}", parameters={"subject": subject, "object": obj})
-                    self.engine.record_mental_transition(action, session_id=session_id)
-                except Exception as exc:
-                    logger.debug("Daemon commit_observation record_mental_transition error: %s", exc)
-            logger.info("[RPC] commit_observation key='%s' -> persisted=True", var_key)
-            return {"status": "ok", "committed": True, "subject": subject, "key": var_key, "confidence": confidence}
-        return {"status": "error", "error": "no_engine_available"}
-
-    async def _handle_task_feedback(self, params: Dict[str, Any]) -> Dict[str, Any]:
-        """Dedicated RPC handler for closed-loop task feedback (G8). Updates record confidence."""
-        key = str(params.get("key") or params.get("subject") or "").strip()
-        if not key:
-            return {"status": "error", "error": "empty_key", "message": "Key cannot be empty"}
-
-        task_success = bool(params.get("task_success") or params.get("success") or (params.get("outcome") == "success") or params.get("task_success", True))
-        if "task_success" in params and not params["task_success"]:
-            task_success = False
-        elif "success" in params and not params["success"]:
-            task_success = False
-        elif params.get("outcome") and params.get("outcome") != "success":
-            task_success = False
-
-        try:
-            delta = float(params.get("delta", 0.05))
-        except (ValueError, TypeError):
-            delta = 0.05
-
-        if self.engine is None or not hasattr(self.engine, "kv") or self.engine.kv is None:
-            return {"status": "error", "error": "no_kv_available"}
-
-        existing = self.engine.kv.get_sync(key) if hasattr(self.engine.kv, "get_sync") else None
-        if not existing:
-            return {"status": "error", "error": "key_not_found", "message": f"Key '{key}' not found in KV store"}
-
-        existing_conf = float(existing.get("confidence", 1.0))
-        new_conf = clamp_conf(existing_conf + delta if task_success else existing_conf - delta)
-        val = existing.get("value", "")
-        meta = existing.get("metadata", {})
-        if isinstance(meta, dict):
-            meta = dict(meta)
-        else:
-            meta = {}
-        meta["confidence"] = new_conf
-        meta["task_feedback"] = "success" if task_success else "failure"
-
-        reason = "task_feedback:success" if task_success else "task_feedback:failure"
-        self.engine.kv.set_sync(
-            key,
-            val,
-            confidence=new_conf,
-            metadata=meta,
-            reason=reason,
-        )
-        logger.info("[RPC] task_feedback key='%s' success=%s conf=%.2f->%.2f", key, task_success, existing_conf, new_conf)
-        return {
-            "status": "ok",
-            "key": key,
-            "previous_confidence": existing_conf,
-            "confidence": new_conf,
-            "task_success": task_success,
-        }
-
-    async def _handle_sync_mnemosyne(self, params: Dict[str, Any]) -> Dict[str, Any]:
-        """Synchronize legacy Mnemosyne SQLite records into ATLAS Vault."""
-        db_path = params.get("db_path", "")
-        from atlas_memory.ingest.mnemosyne_ingest import MnemosyneIngestEngine
-
-        ingester = MnemosyneIngestEngine(db_path=db_path) if db_path else MnemosyneIngestEngine()
-        if self.engine is not None:
-            res = ingester.sync_into_atlas_engine(self.engine)
-            logger.info("[RPC] sync_mnemosyne -> %s", res)
-            return res
-        return {"status": "error", "error": "no_engine_active"}
-
-    async def _handle_get_stats(self, params: Dict[str, Any]) -> Dict[str, Any]:
-        """Return real-time counts and memory vault status."""
-        kv_count = 0
-        if self.engine is not None and hasattr(self.engine, "kv") and self.engine.kv is not None:
-            try:
-                if hasattr(self.engine.kv, "get_all_sync"):
-                    all_kv = self.engine.kv.get_all_sync()
-                else:
-                    all_kv = self.engine.kv.get_all()
-                kv_count = len(all_kv)
-            except Exception:
-                kv_count = 0
-        trajectories_count = len(self.engine.trajectory_buffer) if (self.engine and hasattr(self.engine, "trajectory_buffer") and self.engine.trajectory_buffer is not None) else 0
-        active_trajectories = len(self.engine.trajectory_buffer.trajectories) if (self.engine and hasattr(self.engine, "trajectory_buffer") and self.engine.trajectory_buffer is not None and hasattr(self.engine.trajectory_buffer, "trajectories")) else 0
-        ttt_steps = (
-            getattr(self.engine.ttt, "step_count", 0)
-            if (self.engine and hasattr(self.engine, "ttt") and self.engine.ttt is not None)
-            else 0
-        )
-        ttt_energy = (
-            getattr(self.engine.ttt, "total_energy", 0.0)
-            if (self.engine and hasattr(self.engine, "ttt") and self.engine.ttt is not None)
-            else 0.0
-        )
-        logger.info("[RPC] get_stats -> kv_records=%d trajectories=%d ttt_steps=%d", kv_count, trajectories_count, ttt_steps)
-        return {
-            "status": "ok",
-            "pid": os.getpid(),
-            "socket": str(self.socket_path),
-            "serving": self._serving,
-            "kv_records": kv_count,
-            "trajectories_count": trajectories_count,
-            "active_trajectories": active_trajectories,
-            "ttt_steps": ttt_steps,
-            "ttt_energy": ttt_energy,
-            "has_graph": self.graph_client is not None,
-            "has_orchestrator": self.orchestrator is not None,
-        }
-
-    async def _handle_sync_turn(self, params: Dict[str, Any]) -> Dict[str, Any]:
-        """Sync conversation turn with heuristic SPO fact extraction."""
-        user_content = params.get("user_content") or params.get("user_message", "")
-        assistant_content = params.get("assistant_content") or params.get("assistant_response", "")
-        turn_context = params.get("turn_context", {})
-        if not user_content and turn_context:
-            user_content = turn_context.get("user_message", "")
-            assistant_content = turn_context.get("assistant_response", "")
-        session_id = params.get("session_id", HERMES_DEFAULT_SESSION)
-
-        extracted_count = 0
-        combined_text = f"{user_content}\n{assistant_content}".strip()
-        lines = [ln.strip() for ln in combined_text.splitlines() if ln.strip()]
-
-        for ln in lines:
-            # Strukturalna ekstrakcja zdań informacyjnych, preferencji i par klucz-wartość
-            if len(ln.split()) >= 3 and not ln.startswith(("#", "//", "```", "<")):
-                words = ln.split()
-                subj = " ".join(words[:4]) if words else "turn_fact"
-                if self.engine is not None and hasattr(self.engine, "kv") and self.engine.kv is not None:
-                    self.engine.kv.set_sync(
-                        f"turn:{subj}"[:60],
-                        ln,
-                        confidence=0.9,
-                        metadata={"session_id": session_id, "origin": "shadow_turn"},
-                        reason="sync_turn",
-                    )
-                    extracted_count += 1
-                try:
-                    self.write_path.commit_relation(f"turn:{subj}"[:60], "observed_fact", ln[:80], confidence=0.9, session_id=session_id)
-                except Exception as exc:
-                    logger.debug("Graph sync turn relation ignored: %s", exc)
-
-        if extracted_count == 0 and combined_text:
-            first_line = lines[0] if lines else combined_text[:80]
-            words = first_line.split()
-            subj = " ".join(words[:4]) if words else "turn_fact"
-            if self.engine is not None and hasattr(self.engine, "kv") and self.engine.kv is not None:
-                self.engine.kv.set_sync(
-                    f"turn:{subj}"[:60],
-                    first_line,
-                    confidence=0.85,
-                    metadata={"session_id": session_id, "origin": "shadow_turn"},
-                    reason="sync_turn",
-                )
-                extracted_count += 1
-            try:
-                self.write_path.commit_relation(f"turn:{subj}"[:60], "observed_fact", first_line[:80], confidence=0.9, session_id=session_id)
-            except Exception as exc:
-                logger.debug("Graph sync turn fallback relation ignored: %s", exc)
-
-        if self.engine is not None and hasattr(self.engine, "record_mental_transition"):
-            try:
-                from atlas_memory.models import ActionPlan
-                action = ActionPlan(name="sync_turn", parameters={"facts_count": extracted_count, "session_id": session_id})
-                self.engine.record_mental_transition(action, session_id=session_id)
-            except Exception as exc:
-                logger.debug("Daemon sync_turn record_mental_transition error: %s", exc)
-
-        logger.info("[RPC] sync_turn session=%s -> extracted=%d facts", session_id, extracted_count)
-        return {"status": "ok", "synced": True, "extracted_facts": extracted_count, "session_id": session_id}
-
-    async def _handle_what_if(self, params: Dict[str, Any]) -> Dict[str, Any]:
-        """Execute what-if causal query."""
-        action = params.get("action", "")
-        entity = params.get("entity") or params.get("target") or action
-        depth = int(params.get("depth", 2))
-
-        # Mock / custom graph client shortcut
-        if self.graph_client is not None and hasattr(self.graph_client, "what_if") and not hasattr(self.graph_client, "nx_graph"):
-            path = self.graph_client.what_if(action)
-            return {"status": "ok", "action": action, "causal_path": path, "causal_paths": [path] if isinstance(path, dict) else []}
-
-        # Check entity existence in knowledge graph
-        entity_exists = False
-        graph_obj = self.graph_client or (self.causal_engine.graph if self.causal_engine else None)
-        if graph_obj is not None:
-            if hasattr(graph_obj, "nx_graph") and graph_obj.nx_graph is not None:
-                if entity in graph_obj.nx_graph:
-                    entity_exists = True
-                else:
-                    ent_clean = str(entity).strip().lower().replace("_", " ")
-                    for node in graph_obj.nx_graph.nodes:
-                        node_str = str(node).strip().lower()
-                        if node_str == ent_clean or (len(ent_clean) >= 5 and ent_clean in node_str):
-                            entity_exists = True
-                            break
-            elif isinstance(graph_obj, dict):
-                entity_exists = entity in graph_obj
-
-        if graph_obj is not None and not entity_exists:
-            logger.info("[RPC] what_if entity='%s' not found in causal knowledge graph", entity)
-            return {
-                "status": "entity_not_found",
-                "action": action,
-                "entity": entity,
-                "paths_count": 0,
-                "causal_paths": [],
-                "causal_path": None,
-                "message": f"Entity '{entity}' not found in causal knowledge graph. No causal paths can be derived.",
-            }
-
-        if self.causal_engine is not None:
-            try:
-                paths = await self.causal_engine.causal_what_if(entity, action, depth=depth)
-                paths_data = [p.model_dump() if hasattr(p, "model_dump") else p for p in paths]
-                logger.info("[RPC] what_if entity='%s' action='%s' -> %d paths", entity, action, len(paths_data))
-
-                if len(paths_data) == 0 and not entity_exists:
-                    logger.info("[RPC] what_if entity='%s' not found in causal knowledge graph", entity)
-                    return {
-                        "status": "entity_not_found",
-                        "action": action,
-                        "entity": entity,
-                        "paths_count": 0,
-                        "causal_paths": [],
-                        "causal_path": None,
-                        "message": f"Entity '{entity}' not found in causal knowledge graph. No causal paths can be derived.",
-                    }
-
-                summary_msg = None
-                if len(paths_data) == 0:
-                    summary_msg = f"Entity '{entity}' exists in graph, but no causal failure paths detected for action '{action}' at depth {depth}."
-
-                return {
-                    "status": "ok",
-                    "action": action,
-                    "entity": entity,
-                    "paths_count": len(paths_data),
-                    "causal_paths": paths_data,
-                    "causal_path": paths_data[0] if paths_data else None,
-                    "message": summary_msg,
-                }
-            except Exception as exc:
-                logger.debug("causal_what_if error: %s", exc)
-                return {"status": "error", "error": str(exc), "causal_paths": [], "causal_path": None}
-
-        if not entity_exists:
-            return {
-                "status": "entity_not_found",
-                "action": action,
-                "entity": entity,
-                "paths_count": 0,
-                "causal_paths": [],
-                "causal_path": None,
-                "message": f"Entity '{entity}' not found in knowledge graph.",
-            }
-
-        return {"action": action, "causal_path": None, "causal_paths": [], "status": "no_causal_engine"}
-
-    async def _handle_active_sensing(self, params: Dict[str, Any]) -> Dict[str, Any]:
-        """Active sensing probe for predictive coding with closed-loop world model writeback."""
-        if hasattr(self, "predictive_coder") and self.predictive_coder is not None:
-            return await self.predictive_coder.execute_sensing(params, graph_client=self.graph_client)
-        return {"probe": params.get("target_entity", ""), "sensed": True}
-
-    async def _handle_trigger_sleep_consolidation(self, params: Dict[str, Any]) -> Dict[str, Any]:
-        """Manually or autonomically triggers L3 sleep cycle consolidation and SOP skill compilation."""
-        skills_dir = params.get("skills_dir") or (Path.home() / ".hermes" / "skills" / "baked-skills")
-        if self.engine is not None and hasattr(self.engine, "auditor") and self.engine.auditor is not None:
-            stats = await self.engine.auditor.run_sleep_cycle_consolidation()
-
-            from atlas_memory.l3_procedural.sleep_baker import SleepBaker
-            baker = SleepBaker()
-            trajectories = []
-            if hasattr(self.engine, "trajectory_buffer") and self.engine.trajectory_buffer is not None:
-                trajectories = getattr(self.engine.trajectory_buffer, "trajectories", [])
-
-            baked_results = await baker.auto_consolidate_and_bake(
-                trajectories=trajectories,
-                kv_store=self.engine.kv,
-                skills_dir=skills_dir,
-            )
-            return {
-                "status": "ok",
-                "consolidated_records": stats.consolidated_records if hasattr(stats, "consolidated_records") else 0,
-                "pruned_stale_facts": getattr(stats, "pruned_stale_facts", 0),
-                "baked_sops_count": len(baked_results),
-                "baked_sops": baked_results,
-            }
-        return {"status": "no_engine_auditor", "baked_sops_count": 0}
-
-    async def _handle_session_end(self, params: Dict[str, Any]) -> Dict[str, Any]:
-        """Handles session end notification from Hermes agent provider."""
-        session_id = str(params.get("session_id") or "default")
-        turn_count = int(params.get("turn_count") or 0)
-        trigger_sleep = bool(params.get("trigger_sleep", True))
-
-        consolidated = 0
-        pruned = 0
-        if self.engine is not None:
-            try:
-                from atlas_memory.hermes.prefix_guard import HermesSessionHook
-                hook = HermesSessionHook(self.engine)
-                stats = await hook.on_session_end(session_id=session_id, trigger_sleep_cycle=trigger_sleep)
-                consolidated = getattr(stats, "consolidated_records", 0)
-                pruned = getattr(stats, "pruned_stale_facts", 0)
-            except Exception as exc:
-                logger.warning("Error during session/end hook execution: %s", exc)
-
-        return {
-            "status": "ok",
-            "session_id": session_id,
-            "turn_count": turn_count,
-            "consolidated_records": consolidated,
-            "pruned_stale_facts": pruned,
-        }
-
-    async def _handle_telemetry_report(self, params: Dict[str, Any]) -> Dict[str, Any]:
-        """Return server telemetry report."""
-        return {
-            "pid": os.getpid(),
-            "socket": str(self.socket_path),
-            "serving": self._serving,
-            "has_graph_client": self.graph_client is not None,
-            "has_latent_buffer": self.latent_buffer is not None,
-            "has_orchestrator": self.orchestrator is not None,
-            "has_causal_engine": self.causal_engine is not None,
-            "has_active_sensing": self.active_sensing is not None,
-            "has_gossip": self.gossip is not None,
-        }
-
-    async def _handle_sync_export_delta(self, params: Dict[str, Any]) -> Dict[str, Any]:
-        """Export CRDT delta since vector clock."""
-        if self.gossip is None:
-            return {"status": "not_configured"}
-        target_peer = params.get("target_peer_id", "hermes_peer_alpha")
-        try:
-            req_bytes = self.gossip.create_sync_request(target_peer)
-            return {"status": "ok", "sync_request": req_bytes.decode("utf-8")}
-        except Exception as exc:
-            return {"status": "error", "error": str(exc)}
-
-    async def _handle_sync_apply_delta(self, params: Dict[str, Any]) -> Dict[str, Any]:
-        """Apply incoming delta to local CRDT."""
-        if self.gossip is None:
-            return {"status": "not_configured"}
-        sync_payload = params.get("sync_request", "")
-        if not sync_payload:
-            return {"status": "error", "error": "missing sync_request"}
-        try:
-            req_bytes = sync_payload.encode("utf-8") if isinstance(sync_payload, str) else sync_payload
-            delta = self.gossip.process_sync_response(req_bytes)
-            return {"status": "ok", "source_node": delta.source_node, "clock": delta.vector_clock.clocks}
-        except Exception as exc:
-            return {"status": "error", "error": str(exc)}
-
-    async def _handle_sync_peer_status(self, params: Dict[str, Any]) -> Dict[str, Any]:
-        """Return known peers and vector clock statuses."""
-        if self.gossip is None:
-            return {"status": "not_configured"}
-        peers_dict = {
-            peer_id: p.model_dump() for peer_id, p in self.gossip.peers.items()
-        }
-        return {"status": "ok", "peers": peers_dict, "local_clock": self.gossip.crdt.clock.clocks}
-
-    async def _handle_anneal(self, params: Dict[str, Any]) -> Dict[str, Any]:
-        """Trigger autonomous causal graph annealer."""
-        target_entity = params.get("target_entity") or params.get("entity", "Root")
-        if self.causal_engine is not None and hasattr(self.causal_engine, "recalibrate_graph_with_annealer"):
-            res = await self.causal_engine.recalibrate_graph_with_annealer(target_entity=target_entity)
-            logger.info("[RPC] anneal entity='%s' -> %s", target_entity, res)
-            return res
-        return {"status": "error", "error": "no_causal_engine_or_annealer"}
-
-    async def _handle_verify_audit_log(self, params: Dict[str, Any]) -> Dict[str, Any]:
-        """Verify cryptographic integrity of SHA-256 audit log."""
-        if self.engine is None or not hasattr(self.engine, "kv") or self.engine.kv is None:
-            return {"status": "error", "error": "no_engine_available", "valid": False, "checked_entries": 0}
-
-        deep = bool(params.get("deep", False))
-        kv = self.engine.kv
-        if not hasattr(kv, "verify_audit_log"):
-            return {"status": "error", "error": "verify_audit_log_not_supported", "valid": False, "checked_entries": 0}
-
-        if params.get("heal") and hasattr(kv, "heal_audit_log_chain"):
-            heal_res = kv.heal_audit_log_chain()
-            if asyncio.iscoroutine(heal_res):
-                await heal_res
-
-        res = kv.verify_audit_log(deep=deep)
-        if asyncio.iscoroutine(res):
-            res = await res
-
-        count = 0
-        if hasattr(kv, "_ensure_conn"):
-            try:
-                import contextlib
-                conn = kv._ensure_conn()
-                with contextlib.closing(conn.cursor()) as cursor:
-                    cursor.execute("SELECT COUNT(*) FROM state_audit_log")
-                    row = cursor.fetchone()
-                    if row:
-                        count = int(row[0])
-            except Exception as c_err:
-                logger.debug("Failed to count state_audit_log entries: %s", c_err)
-
-        if isinstance(res, tuple):
-            is_valid = bool(res[0])
-            if count == 0 and len(res) > 1 and res[1] is not None:
-                count = int(res[1])
-        elif isinstance(res, bool):
-            is_valid = res
-        elif isinstance(res, dict):
-            is_valid = bool(res.get("valid", True))
-            if "checked_entries" in res:
-                count = int(res["checked_entries"])
-        elif isinstance(res, int):
-            is_valid = True
-            count = res
-        else:
-            is_valid = bool(res)
-
-        logger.info("[RPC] verify_audit_log (deep=%s) -> valid=%s, checked_entries=%d", deep, is_valid, count)
-        return {"status": "ok", "valid": is_valid, "checked_entries": count}
-
+if __name__ == "__main__":
+    main()

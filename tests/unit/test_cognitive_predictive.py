@@ -20,9 +20,9 @@ from pathlib import Path
 
 import pytest
 
-from atlas_memory.cognitive.hot_buffer import HotBufferPolicy
 from atlas_memory.cognitive.predictive_coder import PredictiveCoder
 from atlas_memory.engine import HybridMemoryEngine
+from atlas_memory.l1_working.hot_buffer import HotBufferPolicy
 
 
 class MockCausalEngine:

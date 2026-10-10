@@ -22,6 +22,24 @@ class SyncCrypto:
         """Generates a secure random 32-byte (256-bit) key."""
         return secrets.token_bytes(32)
 
+    @classmethod
+    def from_psk(cls, psk: str | bytes) -> SyncCrypto:
+        """Derives a deterministic 32-byte AES key from a pre-shared key or passphrase."""
+        if isinstance(psk, str):
+            if len(psk) == 64:
+                try:
+                    return cls(bytes.fromhex(psk))
+                except ValueError:
+                    _ = None  # Fallback to sha256 digest on non-hex string
+            import hashlib
+            return cls(hashlib.sha256(psk.encode("utf-8")).digest())
+        elif isinstance(psk, bytes):
+            if len(psk) == 32:
+                return cls(psk)
+            import hashlib
+            return cls(hashlib.sha256(psk).digest())
+        raise ValueError("PSK must be str or bytes")
+
     def encrypt(self, plaintext: bytes, aad: Optional[bytes] = None) -> bytes:
         """Encrypts plaintext with a fresh 12-byte nonce using AES-256-GCM.
 

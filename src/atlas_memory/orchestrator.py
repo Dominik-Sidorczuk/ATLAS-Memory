@@ -1,610 +1,227 @@
 from __future__ import annotations
 
+import asyncio
+import inspect
 import logging
 import re
 import time
-from typing import Any, Callable, Dict, List, Optional, Protocol, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
+from atlas_memory.cognitive.calibration_engine import is_symbolic_or_identifier
+from atlas_memory.cognitive.conflict_arbiter import ConflictArbiter
+from atlas_memory.cognitive.retrieval.gate import should_retrieve_query
+from atlas_memory.cognitive.retrieval.prefetch import PrefetchEngine
+from atlas_memory.cognitive.retrieval.score import score_candidates
+from atlas_memory.core.models import EpistemicSource, MemoryRecord
 from atlas_memory.extensions.canonicalizer import EntityCanonicalizer
-from atlas_memory.extensions.compactor import ContextCompactor
 from atlas_memory.extensions.decay_scorer import SalienceDecayEngine
-from atlas_memory.extensions.epistemic import EpistemicCalibrator
-from atlas_memory.models import (
-    EpistemicSource,
-    MemoryRecord,
-)
 
 logger = logging.getLogger(__name__)
 
 
-class MnemosyneClientInterface(Protocol):
-
-    """Protokół interfejsu narzędziowego Mnemosyne w Hermes Agent."""
-    async def recall(self, query: str, active_entities: Optional[List[str]] = None) -> Dict[str, Any]: ...
-    async def triple_add(self, subject: str, predicate: str, object_: str, confidence: float, source: str, supersede: bool) -> Any: ...
-    async def triple_query(self, subject: Optional[str] = None, predicate: Optional[str] = None) -> List[Dict[str, Any]]: ...
-
-
 class MemoryOrchestrator:
-    """
-    Cloud Memory Orchestrator (Warstwa Decyzyjna i Polityka Pamięci dla Mnemosyne & Hermes Agent).
-    
-    Działa jako nakładka decyzyjna (Decoupled Policy & Decision Layer) wzbogacająca Mnemosyne o 5 kluczowych przewag:
-    1. Cache Contract: stabilny blok promptu dla ~90% prompt cache hit-rate.
-    2. Retrieval Policy Gate: canonicalizer decyduje czy w ogóle odpytywać Mnemosyne (0 tokenów szumu).
-    3. Epistemic Re-Ranker: sortowanie veracity-first (USER=1.0 > TOOL=0.85 > INFERENCE=0.5).
-    4. Token Budget Governor: twardy limit tokenów na kontekst (np. max 1500 tok).
-    5. Shadow Reconciliation: asynchroniczna ekstrakcja SPO (Qwen-mini) z arbitrażem i mnemosyne_triple_add(supersede=True).
-    6. Salience-Decay GC: usuwanie przestarzałego szumu na bazie wzoru S(f).
-    """
+    """Warstwa Decyzyjna i Fasada Polityki Pamięci dla Hermes Agent."""
 
-    VERACITY_WEIGHTS = {
-        EpistemicSource.USER_EXPLICIT: 1.0,
-        EpistemicSource.TOOL_OUTPUT: 0.85,
-        EpistemicSource.EXTERNAL_DOC: 0.65,
-        EpistemicSource.AGENT_INFERENCE: 0.50,
-    }
+    def __init__(self, engine: Optional[Any] = None, mnemosyne_client: Optional[Any] = None, canonicalizer: Optional[EntityCanonicalizer] = None, decay_engine: Optional[SalienceDecayEngine] = None, compactor: Optional[Any] = None, shadow_extractor: Optional[Callable[[str, str], List[Dict[str, Any]]]] = None, max_retrieval_tokens: int = 1500, calibration_engine: Optional[Any] = None, enable_calibrated_thresholds: Optional[bool] = None) -> None:
+        self.engine, self.mnemosyne = (engine or mnemosyne_client), (mnemosyne_client or engine)
+        self.canonicalizer = canonicalizer or getattr(engine, "canonicalizer", None) or EntityCanonicalizer()
+        self.decay_engine = decay_engine or getattr(engine, "decay_engine", None) or SalienceDecayEngine()
+        self.compactor, self.shadow_extractor, self.max_retrieval_tokens = compactor, shadow_extractor, max_retrieval_tokens
+        from atlas_memory.core.config import get_config
+        eff_calib_flag = get_config().enable_calibrated_thresholds if enable_calibrated_thresholds is None else bool(enable_calibrated_thresholds)
+        self.enable_calibrated_thresholds, self.calibration_engine = eff_calib_flag, calibration_engine
+        self._prefetch_engine = PrefetchEngine(engine=self.engine, calibration_engine=self.calibration_engine, default_token_budget=self.max_retrieval_tokens)
+        self.stats = {"total_turns": 0, "retrieval_skipped_turns": 0, "retrieval_executed_turns": 0, "shadow_facts_extracted": 0, "tokens_saved_estimate": 0}
 
-    TRIVIAL_PROMPT_PATTERN = re.compile(
-        r"^(?:cześć|czesc|hej|hejka|witaj|witajcie|siema|siemanko|siemka|dzień dobry|dzien dobry|dobry wieczór|dobry wieczor|witam|witam serdecznie|elo|yo|hello|hi|hey|greetings|thanks|thank you|thx|dzięki|dzieki|dziękuję|dziekuje|dziękuje|dzięks|ok|okej|dobrze|super|jasne|rozumiem|yes|no|tak|nie|do widzenia|do usłyszenia|na razie|narazie|pa|dobranoc|trzymaj się|bye|goodbye|see you|/.*)[.!?,\s]*(?:wielkie|bardzo|za pomoc|za wszystko|do jutra|do usłyszenia|miłego dnia|miłego wieczoru|serdeczne|z góry)?[.!?,\s]*$",
-        re.IGNORECASE,
-    )
-    CASUAL_GREETING_PATTERN = re.compile(
-        r"^(?:cześć|czesc|hej|hejka|witaj|witajcie|siema|siemanko|dzień dobry|dzien dobry|hello|hi|hey|super|dzięki|dzieki|dziękuję|dziekuje|ok|okej)\b.*(?:jak leci|jak tam|jak się masz|co tam|how are you|how is it going|what's up|do usłyszenia|do widzenia|za pomoc|miłego dnia)",
-        re.IGNORECASE,
-    )
+    def get_relevance_threshold(self, query: str = "") -> float:
+        if getattr(self, "enable_calibrated_thresholds", False) and getattr(self, "calibration_engine", None) is not None:
+            return self.calibration_engine.get_threshold(query_type="symbolic" if is_symbolic_or_identifier(query) else "prose", default=0.25)
+        return 0.25
 
-    def __init__(
-        self,
-        engine: Optional[Any] = None,
-        mnemosyne_client: Optional[Any] = None,
-        canonicalizer: Optional[EntityCanonicalizer] = None,
-        decay_engine: Optional[SalienceDecayEngine] = None,
-        compactor: Optional[ContextCompactor] = None,
-        calibrator: Optional[EpistemicCalibrator] = None,
-        shadow_extractor: Optional[Callable[[str, str], List[Dict[str, Any]]]] = None,
-        max_retrieval_tokens: int = 1500,
-    ):
-        self.engine = engine or mnemosyne_client
-        self.mnemosyne = mnemosyne_client or engine
-        self.canonicalizer = canonicalizer or (engine.canonicalizer if hasattr(engine, "canonicalizer") else EntityCanonicalizer())
-        self.decay_engine = decay_engine or (engine.decay_engine if hasattr(engine, "decay_engine") else SalienceDecayEngine())
-        self.compactor = compactor or (engine.compactor if hasattr(engine, "compactor") else ContextCompactor())
-        self.calibrator = calibrator or (engine.calibrator if hasattr(engine, "calibrator") else EpistemicCalibrator())
-        self.shadow_extractor = shadow_extractor
-        self.max_retrieval_tokens = max_retrieval_tokens
-
-        # Metryki operacyjne
-        self.stats = {
-            "total_turns": 0,
-            "retrieval_skipped_turns": 0,
-            "retrieval_executed_turns": 0,
-            "shadow_facts_extracted": 0,
-            "tokens_saved_estimate": 0,
-        }
-
-    # =========================================================================
-    # Dźwignia 1: Cache Contract & Prefix Guard
-    # =========================================================================
-    def build_cache_contract_prefix(
-        self,
-        profile_state: Optional[Dict[str, Any]] = None,
-        system_rules: Optional[List[str]] = None,
-    ) -> str:
-        """
-        Generuje deterministyczny, stały blok promptu zoptymalizowany pod Prompt Caching
-        (OmniRoute / Anthropic / OpenAI / vLLM KV-cache reuse ~90%).
-        """
-        rules = system_rules or [
-            "You are an autonomous engineering agent (Hermes Agent).",
-            "Memory Protocol: Dynamic facts are injected via Mnemosyne / search_memory.",
-            "Deterministic Execution: Rely on Verified Source of Truth state variables.",
-        ]
+    def build_cache_contract_prefix(self, profile_state: Optional[Dict[str, Any]] = None, system_rules: Optional[List[str]] = None) -> str:
         from atlas_memory.hermes.prefix_guard import PrefixCacheGuard
+        return PrefixCacheGuard.build_immutable_prefix(verified_state=profile_state or {}, system_rules=system_rules or ["You are an autonomous engineering agent (Hermes Agent).", "Memory Protocol: Dynamic facts are injected via Mnemosyne / search_memory.", "Deterministic Execution: Rely on Verified Source of Truth state variables."])
 
-        return PrefixCacheGuard.build_immutable_prefix(
-            verified_state=profile_state or {},
-            system_rules=rules,
-        )
-
-    # =========================================================================
-    # Dźwignia 2: Retrieval Policy Gate
-    # =========================================================================
-    def should_retrieve(
-        self,
-        message: str,
-        explicit_entities: Optional[List[str]] = None,
-    ) -> Tuple[bool, List[str], str]:
-        """
-        Retrieval Policy Gate (Zoptymalizowany O(1) Regex Scanner):
-        - Brak encji w pytaniu -> Skip Mnemosyne Recall (0 tokenów, zero szumu).
-        - Wykryto encje / intencję faktu -> Wyzwolenie odpytania Mnemosyne.
-        """
+    def should_retrieve(self, message: str, explicit_entities: Optional[List[str]] = None) -> Tuple[bool, List[str], str]:
         self.stats["total_turns"] += 1
-        msg_clean = message.lower().strip()
-
-        # 1. Filtrowanie trywialnych powitań i krótkich zwrotów konwersacyjnych (0 tokenów)
-        if self.TRIVIAL_PROMPT_PATTERN.match(msg_clean) or self.CASUAL_GREETING_PATTERN.match(msg_clean):
-            self.stats["retrieval_skipped_turns"] += 1
+        can_ret, ents, reason = should_retrieve_query(message, explicit_entities=explicit_entities, canonicalizer=self.canonicalizer)
+        self.stats["retrieval_executed_turns" if can_ret else "retrieval_skipped_turns"] += 1
+        if not can_ret:
             self.stats["tokens_saved_estimate"] += self.max_retrieval_tokens
-            return False, [], "conversational_turn_no_entity"
+        return can_ret, ents, reason
 
-        detected_entities = []
-        if explicit_entities:
-            detected_entities.extend(self.canonicalizer.canonicalize_list(explicit_entities))
+    def epistemic_rank(self, records: List[MemoryRecord], query: str, current_time: Optional[float] = None) -> List[Tuple[MemoryRecord, float]]:
+        thresh = self.get_relevance_threshold(query)
+        cands = [{"record": r, "subject": r.effective_subject, "predicate": r.predicate, "object": r.object, "vector_score": float((r.metadata or {}).get("vector_score", (r.metadata or {}).get("score", 0.0))), "confidence": float(r.confidence if r.confidence is not None else 1.0), "source_type": getattr(r.source_type, "value", str(r.source_type)), "metadata": dict(r.metadata or {}), "timestamp": float(r.timestamp or 0.0)} for r in records]
+        scored = score_candidates(query=query, candidates=cands)
+        res = [(c["record"], float(c.get("score", 0.0)) * (0.40 if (float((c["record"].metadata or {}).get("vector_score", 0.0)) < thresh and float(c.get("_lex_score", c.get("lexical_score", 0.0))) <= 0.0) else 1.0)) for c in scored if "record" in c]
+        seen = {id(r) for r, _ in res}
+        return res + [(r, 0.0) for r in records if id(r) not in seen]
 
-        for alias, c_id in self.canonicalizer._alias_to_id.items():
-            if len(alias) >= 3 and alias in msg_clean:
-                if c_id not in detected_entities:
-                    detected_entities.append(c_id)
+    def apply_token_budget(self, ranked_records: List[Tuple[MemoryRecord, float]], max_tokens: Optional[int] = None, strategy: str = "knapsack") -> Dict[str, Any]:
+        from atlas_memory.cognitive.retrieval.render import estimate_tokens, pack_knapsack_01, render_context_block
 
-        # 2. Dynamiczne heurystyki dla identyfikatorów kodu, encji złożonych i symboli
-        # - Identyfikatory z łącznikami/podkreśleniami (np. node-01, port_8080, redis_cache)
-        for sym in re.findall(r"\b[A-Za-z0-9]+(?:[-_][A-Za-z0-9]+)+\b", message):
-            c_sym = self.canonicalizer.canonicalize(sym)
-            if c_sym not in detected_entities and len(c_sym) >= 3:
-                detected_entities.append(c_sym)
-
-        # - Identyfikatory CamelCase (np. MemoryRecord, VectorStore, FastEmbed)
-        for camel in re.findall(r"\b[A-Z][a-z0-9]+(?:[A-Z][a-zA-Z0-9]+)+\b", message):
-            c_camel = self.canonicalizer.canonicalize(camel)
-            if c_camel not in detected_entities and len(c_camel) >= 3:
-                detected_entities.append(c_camel)
-
-        # - Terminy w backtickach (np. `cluster_config`, `active_nodes`)
-        for backtick in re.findall(r"`([^`]+)`", message):
-            c_bt = self.canonicalizer.canonicalize(backtick.strip())
-            if c_bt not in detected_entities and len(c_bt) >= 3:
-                detected_entities.append(c_bt)
-
-        # - Akronimy i terminy z wielkich liter (np. NAS, IP, GPU, DB, API, SQL)
-        for acr in re.findall(r"\b[A-Z]{2,}\b", message):
-            c_acr = self.canonicalizer.canonicalize(acr)
-            if c_acr not in detected_entities and len(c_acr) >= 2:
-                detected_entities.append(c_acr)
-
-        # - Nazwy własne i encje pisane z wielkiej litery (np. Loop, Engineering, Obsidian, Superpowers)
-        sentence_starters = {
-            "co", "czy", "jak", "gdzie", "kiedy", "dlaczego", "kto", "czym", "jaki", "jakie",
-            "what", "where", "when", "why", "how", "who", "which", "is", "are", "do", "does",
-            "super", "dzięki", "dobrze", "jasne", "ok", "cześć", "hej", "witaj", "siema", "dzień", "witam", "hello", "hi", "hey", "thanks",
-        }
-        for word in re.findall(r"\b[A-Z][a-zA-Z0-9_-]{2,}\b", message):
-            if word.lower() not in sentence_starters:
-                c_word = self.canonicalizer.canonicalize(word)
-                if c_word not in detected_entities and len(c_word) >= 3:
-                    detected_entities.append(c_word)
-
-        # - Klucze encji rozdzielane dwukropkiem (np. test:hop:p1, chain:sep04:chain_a)
-        for colon_key in re.findall(r"\b[A-Za-z0-9_-]+:[A-Za-z0-9_:-]+\b", message):
-            if colon_key not in detected_entities:
-                detected_entities.append(colon_key)
-
-        # - Alfanumeryczne nazwy węzłów z cyframi (np. p1, p2, p3, node1, port8080)
-        for node in re.findall(r"\b[A-Za-z]+[0-9]+\b", message):
-            if node not in detected_entities:
-                detected_entities.append(node)
-
-        # - Słowa kluczowe intencji wiedzy / wyszukiwania oraz zapytania semantyczne
-        intent_keywords = (
-            "chain", "hop", "fakt", "dawka", "port", "token",
-            "rule", "config", "szukaj", "znajdź", "pokaż", "sprawdź",
-            "notat", "obsidian", "peptyd", "skrypt", "baza", "model",
-            "protokół", "badani", "raport", "informac", "pamięć", "wiedza",
-        )
-        for kw in intent_keywords:
-            if kw in msg_clean:
-                if kw not in detected_entities:
-                    detected_entities.append(kw)
-
-        if detected_entities:
-            self.stats["retrieval_executed_turns"] += 1
-            return True, detected_entities, f"entity_match: {detected_entities}"
-
-        # Czysty czat konwersacyjny bez encji -> brak retrieval (0 tokenów, zero szumu)
-        self.stats["retrieval_skipped_turns"] += 1
-        self.stats["tokens_saved_estimate"] += self.max_retrieval_tokens
-        return False, [], "conversational_turn_no_entity"
-
-    # =========================================================================
-    # Dźwignia 3: Epistemic Re-Ranker w Recall Path
-    # =========================================================================
-    def epistemic_rank(
-        self,
-        records: List[MemoryRecord],
-        query: str,
-        current_time: Optional[float] = None,
-    ) -> List[Tuple[MemoryRecord, float]]:
-        """
-        Re-ranking Mnemosyne: sortowanie po veracity_weight
-        (USER_EXPLICIT = 1.0 > TOOL = 0.85 > INFERENCE = 0.50), dopiero potem cosinus i decay.
-        """
-        now = current_time if current_time is not None else time.time()
-        scored: List[Tuple[MemoryRecord, float]] = []
-        q_terms = set(query.lower().split())
-
-        for rec in records:
-            v_weight = self.VERACITY_WEIGHTS.get(rec.source_type, 0.50)
-
-            # Podobieństwo semantyczne (token overlap + dense vector score)
-            rec_text = f"{rec.effective_subject} {rec.predicate} {rec.object}".lower()
-            overlap = sum(1 for term in q_terms if term in rec_text)
-            token_sim = min(1.0, overlap / max(1, len(q_terms)))
-            meta = rec.metadata or {}
-            vec_score = float(meta.get("vector_score") or meta.get("score") or 0.0)
-            sim_score = max(token_sim, min(1.0, vec_score))
-
-            # Salience & Recency Decay S(f)
-            salience = self.decay_engine.calculate_salience(rec, similarity_score=sim_score, current_time=now)
-
-            # Veracity-first score z adaptacyjną wagą trafności semantycznej
-            conf = float(rec.confidence if rec.confidence is not None else 1.0)
-            has_semantic_relevance = (overlap > 0 or vec_score >= 0.25)
-            is_global_rule = (rec.source_type == EpistemicSource.USER_EXPLICIT and rec.importance_score >= 0.99)
-            if not q_terms or has_semantic_relevance:
-                relevance_mult = 1.0
-            elif is_global_rule:
-                # Downscale unrelated user rules so relevant facts take priority
-                relevance_mult = 0.40
-            else:
-                relevance_mult = 0.15
-
-            final_score = (0.50 * (v_weight * conf) + 0.50 * salience) * relevance_mult
-            # Tier 1 Rule bonus: explicit user rules with high confidence and semantic relevance outrank background facts
-            subj_lower = rec.effective_subject.lower()
-            is_rule_key = subj_lower.startswith(("rule:", "user_rule:", "preference:", "constraint:")) or ":rule:" in subj_lower
-            if is_rule_key and rec.source_type == EpistemicSource.USER_EXPLICIT and conf >= 0.99 and has_semantic_relevance:
-                final_score += 1.0
-            scored.append((rec, float(final_score)))
-
-        scored.sort(key=lambda x: x[1], reverse=True)
-        return scored
-
-    # =========================================================================
-    def _knapsack_01_pack(self, items: List[Dict[str, Any]], budget: int) -> List[Dict[str, Any]]:
-        """
-        0/1 Knapsack DP z adaptacyjnym skalowaniem (scale=1 dla małych budżetów <= 200, scale=5 dla większych).
-        Maksymalizuje całkowitą wartość informacyjną w oknie budżetu tokenów.
-        """
-        scale = 1 if budget <= 200 else 5
-        b_scaled = budget // scale
-        n = len(items)
-        dp = [0.0] * (b_scaled + 1)
-        keep = [[False] * (b_scaled + 1) for _ in range(n)]
-
-        for i, it in enumerate(items):
-            w = max(1, (it["tokens"] + scale - 1) // scale)
-            v = it["score"]
-            for cap in range(b_scaled, w - 1, -1):
-                if dp[cap - w] + v > dp[cap]:
-                    dp[cap] = dp[cap - w] + v
-                    keep[i][cap] = True
-
-        selected_indices = []
-        curr_cap = b_scaled
-        for i in range(n - 1, -1, -1):
-            if keep[i][curr_cap]:
-                selected_indices.append(i)
-                curr_cap -= max(1, (items[i]["tokens"] + scale - 1) // scale)
-        selected_indices.reverse()
-        return [items[i] for i in selected_indices]
-
-    def _greedy_density_pack(self, items: List[Dict[str, Any]], budget: int) -> List[Dict[str, Any]]:
-        """Greedy density fallback dla bardzo dużych zestawów faktów (> 150)."""
-        sorted_by_density = sorted(items, key=lambda x: (x["density"], x["score"]), reverse=True)
-        selected_items = []
-        current_w = 0
-        for it in sorted_by_density:
-            if current_w + it["tokens"] <= budget:
-                selected_items.append(it)
-                current_w += it["tokens"]
-        # Przywrócenie porządku rankingu epistemicznego
-        selected_items.sort(key=lambda x: x["score"], reverse=True)
-        return selected_items
-
-    # =========================================================================
-    # Dźwignia 4: Token Budget Governor (Epistemic Knapsack Packing V24)
-    # =========================================================================
-    def apply_token_budget(
-        self,
-        ranked_records: List[Tuple[MemoryRecord, float]],
-        max_tokens: Optional[int] = None,
-        strategy: str = "knapsack",
-    ) -> Dict[str, Any]:
-        """
-        Alokacja budżetu tokenów z wykorzystaniem Epistemic Knapsack Packing (V24):
-        Maksymalizuje całkowitą gęstość informacyjną I(f) = score / tokens w oknie budżetu.
-        """
         budget = max_tokens or self.max_retrieval_tokens
         if not ranked_records or budget <= 0:
-            return {
-                "selected_facts": [],
-                "formatted_context": "No facts injected (budget empty or skipped).",
-                "estimated_tokens": 0,
-                "budget_tokens": budget,
+            return {"selected_facts": [], "formatted_context": "", "estimated_tokens": 0, "budget_tokens": budget}
+        candidates = [
+            {
+                "record": r,
+                "subject": r.effective_subject,
+                "predicate": r.predicate,
+                "object": r.object,
+                "confidence": r.confidence,
+                "source_type": getattr(r.source_type, "value", str(r.source_type)),
+                "score": float(s),
+                "is_superseded": bool((r.metadata or {}).get("is_superseded")),
+                "metadata": dict(r.metadata or {}),
             }
-
-        # Obliczenie wagi tokenowej dla każdego faktu
-        items = []
-        for rec, score in ranked_records:
-            fact_line = f"- [{rec.source_type.value.upper()}] ({rec.effective_subject}) --[{rec.predicate}]--> {rec.object} (score: {score:.2f})"
-            tokens_line = max(1, len(fact_line) // 4)
-            density = score / tokens_line
-            items.append({
-                "record": rec,
-                "score": score,
-                "line": fact_line,
-                "tokens": tokens_line,
-                "density": density,
-            })
-
-        # Jeśli łączna liczba tokenów mieści się w budżecie -> bierzemy wszystko
-        total_tokens = sum(item["tokens"] for item in items)
-        if total_tokens <= budget:
-            selected_items = items
-        elif strategy == "knapsack" and len(items) <= 150:
-            selected_items = self._knapsack_01_pack(items, budget)
-        else:
-            selected_items = self._greedy_density_pack(items, budget)
-
-        selected_facts: List[Dict[str, Any]] = []
-        formatted_lines: List[str] = []
-        current_token_est = 0
-        for it in selected_items:
-            if current_token_est + it["tokens"] > budget:
-                continue
-            rec = it["record"]
-            current_token_est += it["tokens"]
-            selected_facts.append({
-                "subject": rec.effective_subject,
-                "predicate": rec.predicate,
-                "object": rec.object,
-                "confidence": rec.confidence,
-                "source_type": rec.source_type.value if hasattr(rec.source_type, "value") else str(rec.source_type),
-                "score": it["score"],
-            })
-            formatted_lines.append(it["line"])
-
-        formatted_context = "\n".join(formatted_lines)
-
+            for r, s in ranked_records
+        ]
+        packed = pack_knapsack_01(candidates, budget=budget)
         return {
-            "selected_facts": selected_facts,
-            "formatted_context": formatted_context,
-            "estimated_tokens": current_token_est,
+            "selected_facts": [
+                {
+                    "subject": it["subject"],
+                    "predicate": it["predicate"],
+                    "object": it["object"],
+                    "confidence": it["confidence"],
+                    "source_type": it["source_type"],
+                    "score": it["score"],
+                }
+                for it in packed
+            ],
+            "formatted_context": render_context_block(packed),
+            "estimated_tokens": sum(estimate_tokens(it) for it in packed),
             "budget_tokens": budget,
         }
 
-
-    # =========================================================================
-    # Fasada API: Pełne orkiestrowane wyszukiwanie z filtrem intencji i budżetem
-    # =========================================================================
-    async def orchestrated_recall(
-        self,
-        user_message: str,
-        explicit_entities: Optional[List[str]] = None,
-        mnemosyne_recall_fn: Optional[Callable] = None,
-        session_id: Optional[str] = None,
-    ) -> Dict[str, Any]:
-        """
-        End-to-end recall flow:
-        1. Retrieval Policy Gate (Canonicalizer + Intent Gate)
-        2. Mnemosyne / HybridMemoryEngine Query (Vector + Graph + KV State)
-        3. Epistemic Re-Ranking (Veracity First + Decay + Dense Cosine Score)
-        4. Token Budget Governor (0/1 Knapsack Packing).
-        """
-        self.stats["total_turns"] += 1
-
-        # 1. Retrieval Policy Gate (Canonicalizer + Intent Gate)
-        should_run, entities, reason = self.should_retrieve(user_message, explicit_entities=explicit_entities)
+    async def orchestrated_recall(self, user_message: str = "", explicit_entities: Optional[List[str]] = None, **kwargs: Any) -> Dict[str, Any]:
+        eff_query = kwargs.get("query") if kwargs.get("query") is not None else user_message
+        should_run, entities, reason = self.should_retrieve(eff_query, explicit_entities=explicit_entities)
         if not should_run:
-            return {
-                "retrieval_skipped": True,
-                "reason": reason,
-                "canonical_entities": entities,
-                "context_block": "",
-                "matched_facts_count": 0,
-                "records": [],
-                "selected_facts": [],
-            }
+            return {"retrieval_skipped": True, "skipped": True, "reason": reason, "canonical_entities": entities, "context_block": "", "matched_facts_count": 0, "records": [], "selected_facts": []}
+        fn = getattr(self.engine, "recall", None) or getattr(self.mnemosyne, "recall", None)
+        if fn is not None and not (hasattr(self.engine, "kv") and self.engine.kv is not None):
+            raw = await fn(eff_query, active_entities=entities)
+            recs = [MemoryRecord(subject=r["subject"], predicate=r.get("predicate", ""), object=str(r.get("object", "")), confidence=float(r.get("confidence", 1.0)), source_type=EpistemicSource.TOOL_OUTPUT) for r in raw.get("graph_topology", {}).get("relations", [])] + [MemoryRecord(**v["record"]) for v in raw.get("semantic_context", []) if v.get("record")] + [MemoryRecord(subject=k, predicate="state_variable", object=str(v.get("value", "") if isinstance(v, dict) else v), confidence=float(v.get("confidence", 1.0) if isinstance(v, dict) else 1.0), source_type=EpistemicSource.USER_EXPLICIT) for k, v in raw.get("verified_state", {}).items()] if isinstance(raw, dict) else [r if isinstance(r, MemoryRecord) else MemoryRecord(**r) for r in raw]
+            ranked = self.epistemic_rank(recs, query=eff_query)
+            budgeted = self.apply_token_budget(ranked, max_tokens=kwargs.get("token_budget") or self.max_retrieval_tokens)
+            return {"retrieval_skipped": False, "skipped": False, "reason": reason, "canonical_entities": entities, "context_block": budgeted["formatted_context"], "matched_facts_count": len(budgeted["selected_facts"]), "estimated_tokens": budgeted["estimated_tokens"], "records": [r for r, _ in ranked], "selected_facts": budgeted["selected_facts"]}
+        engine_p = getattr(self, "_prefetch_engine", None) or PrefetchEngine(engine=self.engine, calibration_engine=self.calibration_engine, default_token_budget=self.max_retrieval_tokens)
+        res = await engine_p.execute({"query": eff_query, "session_id": kwargs.get("session_id"), "token_budget": kwargs.get("token_budget") or self.max_retrieval_tokens, "limit": kwargs.get("limit", 15)})
+        res["retrieval_skipped"] = res.get("skipped", False)
+        raw_recs = res.get("records", [])
+        res["selected_facts"] = res.get("selected_facts") or [{"subject": r.get("subject", ""), "predicate": r.get("predicate", ""), "object": r.get("object", ""), "confidence": r.get("confidence", 1.0), "score": r.get("score", 0.0)} for r in raw_recs if isinstance(r, dict)]
+        res["matched_facts_count"] = len(res["selected_facts"])
+        res["records"] = [r if isinstance(r, MemoryRecord) else MemoryRecord(subject=r.get("subject", ""), predicate=r.get("predicate", "stated_memory"), object=str(r.get("object", "")), confidence=float(r.get("confidence", 1.0)), source_type=EpistemicSource.USER_EXPLICIT if r.get("source_type") not in EpistemicSource._value2member_map_ else EpistemicSource(r.get("source_type")), metadata=r.get("metadata", {}), timestamp=float(r.get("timestamp", 0.0))) for r in raw_recs]
+        return res
 
-        # 2. Wywołanie Mnemosyne lub podpiętego silnika
-        records: List[MemoryRecord] = []
-        fn = mnemosyne_recall_fn or (
-            self.engine.recall if hasattr(self, "engine") and self.engine is not None and hasattr(self.engine, "recall")
-            else (self.mnemosyne.recall if hasattr(self.mnemosyne, "recall") else None)
-        )
-
-        if fn is not None:
-            raw_res = await fn(user_message, active_entities=entities)
-            if isinstance(raw_res, dict):
-                # 2a. Ekstrakcja trójek topologii grafowej
-                for rel in raw_res.get("graph_topology", {}).get("relations", []):
-                    records.append(MemoryRecord(
-                        subject=rel.get("subject", ""),
-                        predicate=rel.get("predicate", ""),
-                        object=str(rel.get("object", "")),
-                        confidence=float(rel.get("confidence", 1.0)),
-                        source_type=EpistemicSource.TOOL_OUTPUT,
-                    ))
-
-                # 2b. Ekstrakcja wektorowego kontekstu semantycznego (Qdrant)
-                for vec in raw_res.get("semantic_context", []):
-                    rec_data = vec.get("record", {})
-                    if rec_data:
-                        try:
-                            rec_meta = dict(rec_data.get("metadata") or {})
-                            rec_meta["vector_score"] = float(vec.get("score", 0.0))
-                            rec_data["metadata"] = rec_meta
-                            records.append(MemoryRecord(**rec_data))
-                        except Exception as parse_err:
-                            logger.debug("Failed parsing vector record: %s", parse_err)
-
-                # 2c. Ekstrakcja twardych zmiennych stanu (Verified State)
-                for s_key, s_val in raw_res.get("verified_state", {}).items():
-                    if isinstance(s_val, dict):
-                        val_str = str(s_val.get("value", ""))
-                        conf = float(s_val.get("confidence", 1.0))
-                        meta = s_val.get("metadata", {}) or {}
-                    else:
-                        val_str = str(s_val)
-                        conf = 1.0
-                        meta = {}
-                    records.append(MemoryRecord(
-                        subject=s_key,
-                        predicate="state_variable",
-                        object=val_str,
-                        confidence=conf,
-                        source_type=EpistemicSource.USER_EXPLICIT,
-                        metadata=meta,
-                    ))
-            elif isinstance(raw_res, list):
-                for item in raw_res:
-                    if isinstance(item, MemoryRecord):
-                        records.append(item)
-                    elif isinstance(item, dict):
-                        try:
-                            records.append(MemoryRecord(**item))
-                        except Exception as item_err:
-                            logger.debug("Failed parsing record item: %s", item_err)
-
-        # 3. Epistemic Re-Ranking
-        ranked = self.epistemic_rank(records, query=user_message)
-
-        # 4. Token Budget Governor
-        budgeted = self.apply_token_budget(ranked, max_tokens=self.max_retrieval_tokens)
-
-        return {
-            "retrieval_skipped": False,
-            "reason": reason,
-            "canonical_entities": entities,
-            "context_block": budgeted["formatted_context"],
-            "matched_facts_count": len(budgeted["selected_facts"]),
-            "estimated_tokens": budgeted["estimated_tokens"],
-            "records": [r for r, _ in ranked],
-            "selected_facts": budgeted["selected_facts"],
-        }
-
-    # =========================================================================
-    # Dźwignia 5: Shadow Reconciliation z Arbitrażem (SPO + mnemosyne_triple_add)
-    # =========================================================================
-    async def shadow_reconcile(
-        self,
-        user_msg: str,
-        agent_response: str,
-        session_id: str = "default_session",
-        triple_add_fn: Optional[Callable] = None,
-    ) -> List[MemoryRecord]:
-        """
-        Asynchroniczny worker na tanim modelu (Qwen-mini):
-        - Ekstrakcja trójek SPO {subject, predicate, object, source_type}
-        - Blokada nadpisywania deklaracji usera przez domysły modelu
-        - Wywołanie mnemosyne_triple_add(supersede=True).
-        """
-        extracted_raw: List[Dict[str, Any]] = []
-
-        if self.shadow_extractor is not None:
+    async def shadow_reconcile(self, user_msg: str, agent_response: str, session_id: str = "default_session", triple_add_fn: Optional[Callable] = None) -> List[MemoryRecord]:
+        raw = []
+        if self.shadow_extractor:
             try:
-                extracted_raw = self.shadow_extractor(user_msg, agent_response)
+                if inspect.iscoroutinefunction(self.shadow_extractor):
+                    raw = await self.shadow_extractor(user_msg, agent_response)
+                else:
+                    raw = await asyncio.to_thread(self.shadow_extractor, user_msg, agent_response)
             except Exception:
-                extracted_raw = []
-
-        if not extracted_raw:
-            extracted_raw = self._fallback_extract_facts(user_msg, agent_response)
-
-        committed_records: List[MemoryRecord] = []
-        add_fn = triple_add_fn or (getattr(self.mnemosyne, "triple_add", None) if self.mnemosyne else None)
-
-        for item in extracted_raw:
-            raw_subj = item.get("subject", "").strip()
-            pred = item.get("predicate", "").strip()
-            obj = str(item.get("object", "")).strip()
-            if not (raw_subj and pred and obj):
+                raw = []
+        committed, add_fn = [], (triple_add_fn or (getattr(self.mnemosyne, "triple_add", None) if self.mnemosyne else None))
+        for it in (raw or self._fallback_extract_facts(user_msg, agent_response)):
+            raw_s, pred, obj = it.get("subject", "").strip(), it.get("predicate", "").strip(), str(it.get("object", "")).strip()
+            if not (raw_s and pred and obj):
                 continue
-
-            # Kanonizacja encji przed zapisem
-            canon_subj = self.canonicalizer.canonicalize(raw_subj)
-
-            src_str = item.get("source_type", "user_explicit")
-            try:
-                source_type = EpistemicSource(src_str)
-            except ValueError:
-                source_type = EpistemicSource.USER_EXPLICIT
-
-            rec = MemoryRecord(
-                subject=raw_subj,
-                canonical_entity_id=canon_subj,
-                predicate=pred,
-                object=obj,
-                confidence=float(item.get("confidence", 1.0)),
-                source_type=source_type,
-                timestamp=time.time(),
-                is_state_variable=bool(item.get("is_state_variable", False)),
-                source_session_id=session_id,
+            # V151 (Wektor I, H1): detoksykacja proweniencji cieniowej.
+            # Ekstrakcja LLM-a NIGDY nie dowodzi woli użytkownika — dawny
+            # fallback 'user_explicit' (linia 134) fałszował dowodzenie
+            # najwyższej rangi; od V151 fallback = SHADOW_INFERENCE.
+            # Jawny claim 'user_explicit' ze shadow-a jest DEMOWANY do
+            # SHADOW_INFERENCE; 'tool_output'/'agent_inference' pozostają.
+            st_v = it.get("source_type", EpistemicSource.SHADOW_INFERENCE.value)
+            st = EpistemicSource(st_v) if st_v in EpistemicSource._value2member_map_ else EpistemicSource.SHADOW_INFERENCE
+            if st == EpistemicSource.USER_EXPLICIT:
+                st = EpistemicSource.SHADOW_INFERENCE
+            # V151.1 (FILAR I): typologiczna bariera aktu mowy. Trójka o temacie
+            # będącym aktem konwersacyjnym (meta-pytanie, discourse-garbage) nie
+            # podlega kanonizacji — wyrzucamy ją zanim trafi do arbitra/commita.
+            from atlas_memory.core.models import (
+                SHADOW_PROMOTION_ACTIONS,
+                SpeechAct,
+                classify_speech_act,
             )
-
-            # Wywołanie Mnemosyne triple_add z supersede=True
-            if add_fn is not None:
+            speech_act = classify_speech_act(raw_s, pred, obj)
+            if speech_act == SpeechAct.CONVERSATIONAL_TURN:
+                logger.info("[V151.1/FILAR-I] Shadow conversational turn dropped subject=%s", raw_s)
+                continue
+            rec = MemoryRecord(subject=raw_s, canonical_entity_id=self.canonicalizer.canonicalize(raw_s), predicate=pred, object=obj, confidence=float(it.get("confidence", 1.0)), source_type=st, timestamp=time.time(), is_state_variable=bool(it.get("is_state_variable", False)), source_session_id=session_id, speech_act=speech_act)
+            # V151 (Wektor I, H1): zmienne stanu cieniowe MUSZĄ przejść ConflictArbiter
+            # — od teraz brama epistemiczna jest obowiązkowa (default: ConflictArbiter()).
+            if rec.is_state_variable:
+                arb = getattr(self, "arbiter", None) or ConflictArbiter()
                 try:
-                    await add_fn(
-                        subject=canon_subj,
-                        predicate=pred,
-                        object_=obj,
-                        confidence=rec.confidence,
-                        source=source_type.value,
-                        supersede=True,
-                    )
+                    arb_res = arb.arbitrate(key=str(rec.canonical_entity_id or raw_s), val=rec.object, confidence=rec.confidence, metadata={"origin": "shadow_reconcile", "source_type": st.value}, existing_items={})
                 except Exception as exc:
-                    logger.debug("Mnemosyne triple_add failed in shadow reconciliation: %s", exc)
-
-            # Jeśli silnik HybridMemoryEngine jest podpięty, wykonaj commit_observation
-            if self.engine is not None and hasattr(self.engine, "commit_observation"):
+                    logger.warning("Shadow ConflictArbiter failed for %s — blokada zapisu: %s", rec.canonical_entity_id, exc)
+                    arb_res = None
+                if arb_res is None or str(arb_res.action) in ("reject", "reject_conflict", "block"):
+                    logger.info("[V151] Shadow state write odrzucony przez arbiter: key=%s action=%s", rec.canonical_entity_id, getattr(arb_res, "action", "arbiter_error"))
+                    continue
+                action_str = str(arb_res.action)
+                rec.metadata["shadow_arbitration"] = action_str
+                # V151.1 (FILAR I): bramka uprawnień state_variable dla cienia.
+                # Werdykt arbitra, który ROZSTRZYGA zapis (czysta zgoda lub
+                # rewizja poglądu): accept / supersede / promote / accept_conflict.
+                # Werdykt NIEROZSTRZYGNIĘTY (warn_conflict) → zostaje zwykłym
+                # faktem (is_state_variable=False) z shadow_promotion='pending_arbitration'
+                # dla audytu; engine.commit_observation powtórzy tę bramkę
+                # kontraktowo, jeśli obiekt przejdzie z zewnątrz.
+                is_conflict = bool(getattr(arb_res, "is_conflict", False))
+                is_promoted = (not is_conflict) and (
+                    action_str in SHADOW_PROMOTION_ACTIONS
+                    or action_str in ("accept", "supersede")
+                )
+                if is_promoted:
+                    rec.metadata["shadow_promotion"] = "arbitration_promoted"
+                else:
+                    rec.metadata["shadow_promotion"] = "pending_arbitration"
+                    rec.is_state_variable = False
+                    logger.info(
+                        "[V151.1/FILAR-I] Shadow state demoted to plain fact: key=%s action=%s conflict=%s",
+                        rec.canonical_entity_id, action_str, is_conflict,
+                    )
+            if add_fn:
+                try:
+                    await add_fn(subject=rec.canonical_entity_id, predicate=pred, object_=obj, confidence=rec.confidence, source=st.value, supersede=True)
+                except Exception as exc:
+                    logger.debug("Mnemosyne triple_add failed: %s", exc)
+            if self.engine and hasattr(self.engine, "commit_observation"):
                 try:
                     await self.engine.commit_observation(rec)
                 except Exception as exc:
-                    logger.debug("Engine commit_observation failed in shadow reconciliation: %s", exc)
-
-
-            committed_records.append(rec)
+                    logger.debug("Engine commit_observation failed: %s", exc)
+            committed.append(rec)
             self.stats["shadow_facts_extracted"] += 1
+        return committed
 
-        return committed_records
-
-    def _fallback_extract_facts(self, user_msg: str, agent_response: str) -> List[Dict[str, Any]]:
-        facts = []
-        text = f"{user_msg} {agent_response}"
-        matches = re.findall(r"(?:mój |moje )?(\w[\w\s]{1,20}?)\s+(?:to|jest|wynosi)\s+([\w\.\-\/]+)", text, re.IGNORECASE)
-        for subj, obj in matches:
-            facts.append({
+    def _fallback_extract_facts(self, user_msg: str, agent_response: str = "") -> List[Dict[str, Any]]:
+        text = (user_msg or "").strip()
+        if not text:
+            return []
+        matches = list(re.findall(r"(?:mój |moje )?(\w[\w\s]{1,20}?)\s+(?:to|jest|wynosi)\s+([\w\.\-\/]+)", text, re.IGNORECASE))
+        matches.extend(re.findall(r"(?:zmień|ustaw)\s+(\w[\w\s]{1,20}?)\s+na\s+([\w\.\-\/]+)", text, re.IGNORECASE))
+        return [
+            {
                 "subject": subj.strip(),
                 "predicate": "state_value",
                 "object": obj.strip(),
                 "source_type": "user_explicit",
                 "confidence": 0.95,
                 "is_state_variable": True,
-            })
-        return facts
+            }
+            for subj, obj in matches
+        ]
 
-    # =========================================================================
-    # Dźwignia 6: Formalny Decay S(f) i Auto-GC
-    # =========================================================================
-    def prune_stale_facts(
-        self,
-        facts: List[MemoryRecord],
-        threshold: float = 0.25,
-        current_time: Optional[float] = None,
-    ) -> Tuple[List[MemoryRecord], List[MemoryRecord]]:
-        """
-        Filtruje listę faktów na bazie wzoru S(f):
-        Zwraca: (aktywne_fakty, usunięty_szum)
-        """
-        now = current_time if current_time is not None else time.time()
-        active = []
-        pruned = []
-
-        for f in facts:
-            if self.decay_engine.should_prune(f, current_time=now):
-                pruned.append(f)
-            else:
-                active.append(f)
-
-        return active, pruned
+    def prune_stale_facts(self, facts: List[MemoryRecord], threshold: float = 0.25, current_time: Optional[float] = None) -> Tuple[List[MemoryRecord], List[MemoryRecord]]:
+        now = current_time or time.time()
+        return [f for f in facts if not self.decay_engine.should_prune(f, current_time=now)], [f for f in facts if self.decay_engine.should_prune(f, current_time=now)]

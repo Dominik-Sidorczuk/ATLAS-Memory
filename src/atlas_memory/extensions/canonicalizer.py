@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import logging
 import re
 from typing import Dict, List, Optional, Set
 
 from pydantic import BaseModel, Field
+
+logger = logging.getLogger(__name__)
 
 _NORM_PUNCT_RE = re.compile(r"[^\w\s\-_]")
 _NORM_SPACES_RE = re.compile(r"\s+")
@@ -31,21 +34,23 @@ class EntityCanonicalizer:
         self._init_default_rules()
 
     def _init_default_rules(self) -> None:
-        """Inicjalizacja podstawowych encji dla środowiska serwerowego i agentowego."""
-        self.register_entity(
-            canonical_id="entity_nas_01",
-            canonical_name="TrueNAS Server",
-            aliases=["mój nas", "nas", "truenas", "advantech", "serwer plików", "home nas"],
-            entity_type="hardware_server",
-            description="Lokalny serwer plików NAS TrueNAS na maszynie Advantech",
-        )
-        self.register_entity(
-            canonical_id="entity_agent_core",
-            canonical_name="Hermes Agent",
-            aliases=["hermes", "hermes agent", "asystent", "mój agent", "agent core"],
-            entity_type="software_agent",
-            description="Rdzeń autonomicznego agenta Hermes",
-        )
+        """Inicjalizacja encji zadeklarowanych w profilach domenowych (Filar I)."""
+        try:
+            from atlas_memory.domain.registry import DomainProfileRegistry
+            profile_entities = DomainProfileRegistry.get_instance().get_all_entities()
+            for ent in profile_entities:
+                cid = ent.get("canonical_id")
+                cname = ent.get("canonical_name", cid)
+                if cid:
+                    self.register_entity(
+                        canonical_id=cid,
+                        canonical_name=cname,
+                        aliases=ent.get("aliases", []),
+                        entity_type=ent.get("entity_type", "concept"),
+                        description=ent.get("description", ""),
+                    )
+        except Exception as exc:
+            logger.debug("Failed to load profile entities into canonicalizer: %s", exc)
 
     def _normalize(self, text: str) -> str:
         """Normalizacja tekstu: małe litery, usunięcie zbędnych znaków i spacji."""

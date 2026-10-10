@@ -14,7 +14,6 @@
 3. [Memory Tiers L0–L3](#3-memory-tiers-l0l3)
 4. [Causal Reasoning (Causal Engine)](#4-causal-reasoning-causal-engine)
 5. [Multi-Agent Sync (Delta-CRDT & Gossip)](#5-multi-agent-sync-delta-crdt--gossip)
-6. [Vector Quantization (MIB 32x & SIMD Popcount)](#6-vector-quantization-mib-32x--simd-popcount)
 7. [Active Perception (Active Sensing)](#7-active-perception-active-sensing)
 8. [Micro-Sidecar IPC Architecture](#8-micro-sidecar-ipc-architecture)
 9. [Hermes Plugin & Memory Contract](#9-hermes-plugin--memory-contract)
@@ -51,7 +50,7 @@ ATLAS PARADIGMS
         │
         ▼
 ┌──────────────────────────────────────────────────────┐
-│ 1. KV-Cache Prefix Guard & CacheHitMonitor           │
+│ 1. KV-Cache Prefix Guard                           │
 │    • build_immutable_prefix(identity + profile)      │  <-- ~90% Prompt Cache Hit
 └────────────────────────┬─────────────────────────────┘
         │
@@ -163,28 +162,16 @@ $$\text{SeverityScore}(u) = \frac{|\text{ReachableNodes}(u)|}{|\text{TotalGraphN
 
 ---
 
-## 5. Multi-Agent BFT-CRDT Synchronization
+## 5. Multi-Agent Sync (Delta-CRDT & Gossip)
 Module `src/atlas_memory/sync/` — disconnection-tolerant, cryptographically secure knowledge sync between agent instances:
 - **Delta-State CRDT**: VectorClock with Lamport timestamps for causality preservation
-- **Byzantine Fault Tolerant LWW-Set** (`BFTLWWSet`): requires $2f+1$ valid threshold signatures (`ThresholdSigner`) before committing state change
 - **Epistemic Peer Reputation** (`EpistemicReputationTracker`): tracks accuracy of incoming updates; peers dropping below threshold are quarantined
 - **Secure Gossip Transport**: UDP-based peer discovery with AES-256-GCM authenticated payload encryption
 - **LWW Tombstone Garbage Collection**: automated cleanup of tombstoned records past configurable TTL
 
 ---
 
-## 6. Vector Quantization & Hardware Acceleration
-Module `src/atlas_memory/quantization/` — memory footprint reduction and scan acceleration:
-- **RaBitQ Asymptotically Optimal 1-Bit Quantization**:
-  - Distance estimation with theoretical error bounds
-  - 32× RAM compression ($1536 \to 48$ bytes per vector)
-  - SIMD Hamming distance popcount with fallback path
-- **Matryoshka Representation Learning (MRL)**: Multi-resolution embedding shortlisting ($D=\{64, 128, 256, 512, 1536\}$) for tiered retrieval filtering
-- **MIB Median Binarization**: Bitset generation with fastmath popcount
-
----
-
-## 7. Active Sensing & External Discrepancy Detection
+ & External Discrepancy Detection
 Module `src/atlas_memory/active/` — external active perception loop:
 
 - **Zero-LLM Telemetry Discrepancy Detection**: when observation exceeds tolerance threshold
@@ -196,7 +183,7 @@ $$|V_{obs} - V_{exp}| > \text{tolerance}$$
 
 ---
 
-## 8. Micro-Sidecar IPC Architecture
+## 7. Micro-Sidecar IPC Architecture
 
 ATLAS runs as a standalone daemon process to avoid library conflicts:
 
@@ -222,7 +209,7 @@ ATLAS runs as a standalone daemon process to avoid library conflicts:
 
 ---
 
-## 9. Hermes Plugin & Memory Contract
+## 8. Hermes Plugin & Memory Contract
 
 ATLAS fully complies with the official Hermes plugin system:
 
